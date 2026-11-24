@@ -232,6 +232,14 @@ xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driv
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. Add
+`-Pipelines` to warm the GPU driver's compute-pipeline cache too (slower and GPU/driver-specific):
+
+```powershell
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf'
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf' -Pipelines
+```
+
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
