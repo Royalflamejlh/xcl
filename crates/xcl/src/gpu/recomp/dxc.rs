@@ -797,6 +797,10 @@ where
         MISSED.with(|m| m.set(true));
         return Err("DXIL not compiled yet".into());
     }
+    let limit = SOURCE_LIMIT.with(|c| c.get());
+    if limit != 0 && src.len() > limit {
+        return Err(format!("{OVER_SOURCE_LIMIT}: {} B of HLSL, the limit is {limit} B", src.len()));
+    }
     counters.misses.fetch_add(1, Ordering::Relaxed);
     let flight = cache_flight((dir.clone(), key));
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
@@ -894,6 +898,22 @@ pub fn defer() -> bool {
 /// Inside `cached_only`.
 pub fn in_cached_only() -> bool {
     CACHED_ONLY.with(|c| c.get())
+}
+
+/// How the error of a compile refused by `with_source_limit` starts.
+pub const OVER_SOURCE_LIMIT: &str = "DXC: source over the size limit";
+
+thread_local! {
+    static SOURCE_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Inside `f` this thread's cache misses with more than `bytes` of HLSL are refused instead of
+/// compiled (0: no limit), for `xcl shaders --precompile`.
+pub fn with_source_limit<R>(bytes: usize, f: impl FnOnce() -> R) -> R {
+    SOURCE_LIMIT.with(|c| c.set(bytes));
+    let r = f();
+    SOURCE_LIMIT.with(|c| c.set(0));
+    r
 }
 
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
@@ -1072,6 +1092,24 @@ mod cache_tests {
         assert_eq!(rebuilt, synthetic_dxil(8));
         let (_, hit) = compile_cached_in_with(&dir, "corrupt", "main", "cs_6_6", || panic!("valid rebuilt entry was not reused")).unwrap();
         assert!(hit);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_source_over_the_limit_is_refused_unless_cached() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (big, small) = ("a source over the limit", "small");
+        with_source_limit(small.len(), || {
+            let error = compile_cached_in_with(&dir, big, "main", "cs_6_6", || panic!("compiled over the limit")).unwrap_err();
+            assert!(error.starts_with(OVER_SOURCE_LIMIT), "{error}");
+            assert!(!compile_cached_in_with(&dir, small, "main", "cs_6_6", || Ok(synthetic_dxil(3))).unwrap().1);
+        });
+        let (dxil, hit) = compile_cached_in_with(&dir, big, "main", "cs_6_6", || Ok(synthetic_dxil(4))).unwrap();
+        assert!(!hit);
+        with_source_limit(small.len(), || {
+            assert_eq!(compile_cached_in_with(&dir, big, "main", "cs_6_6", || panic!("cached")).unwrap(), (dxil, true));
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

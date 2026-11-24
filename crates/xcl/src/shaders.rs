@@ -779,7 +779,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let pipelines = args.iter().any(|a| a == "--pipelines");
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, opt("--max-source-mb").unwrap_or(8), t0);
     }
     if args.iter().any(|a| a == "--direct") {
         return direct_sweep(&input, args, top, json, t0);
@@ -996,6 +996,9 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 /// no split form, so a title asked for other HLSL and compiled everything again. Still
 /// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
 /// mesh pass-through, which the runtime builds for its pixel shader.
+/// `--max-source-mb N` (8; 0: no limit): a program with more HLSL than that is left to the runtime.
+/// A retail pack has six such compute programs (12 - 155 MB) among 2 689: at the first of them
+/// the pass was killed at 8 GB; with the limit that slice's other 540 compiled at 4.0 GB.
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
 /// ABI root signature with its static samplers). Save the driver's compiled blob in the same
 /// cache the runtime reads at startup. Nothing runs on the GPU.
@@ -1097,7 +1100,7 @@ impl Pipelines {
     }
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, max_source_mb: usize, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -1113,6 +1116,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let too_big = AtomicUsize::new(0);
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
@@ -1147,13 +1151,14 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                    match recomp::dxc::with_source_limit(max_source_mb << 20, || recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows)) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
                                 p.make(&c);
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
+                        Err(e) if e.starts_with(recomp::dxc::OVER_SOURCE_LIMIT) => too_big.fetch_add(1, Ordering::Relaxed),
                         Err(e) => {
                             let mut g = errors.lock().unwrap();
                             if g.len() < 10 {
@@ -1191,9 +1196,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             continue;
                         }
                         for (profile, src) in &jobs {
-                            match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
+                            match recomp::dxc::with_source_limit(max_source_mb << 20, || recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile)) {
                                 Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
                                 Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
+                                Err(e) if e.starts_with(recomp::dxc::OVER_SOURCE_LIMIT) => too_big.fetch_add(1, Ordering::Relaxed),
                                 Err(e) => {
                                     let mut g = errors.lock().unwrap();
                                     if g.len() < 10 {
@@ -1220,6 +1226,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    let too_big = too_big.into_inner();
+    if too_big != 0 {
+        println!("left to the runtime (more than {max_source_mb} MB of HLSL, --max-source-mb) {too_big}");
+    }
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
