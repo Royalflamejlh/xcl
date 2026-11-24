@@ -919,9 +919,9 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     let made = (|| -> windows::core::Result<State> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
         let rb_queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let rb_done_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let fence: ID3D12Fence = super::real::create_raw_fence(dev)?;
+        let rb_fence: ID3D12Fence = super::real::create_raw_fence(dev)?;
+        let rb_done_fence: ID3D12Fence = super::real::create_raw_fence(dev)?;
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
         let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
         for _ in 0..UPLOAD_SLOTS {
@@ -2035,7 +2035,7 @@ unsafe fn readback_after(rb_queue: &ID3D12CommandQueue, q: &ID3D12CommandQueue) 
     if !m.contains_key(&key) {
         let mut dev: Option<ID3D12Device> = None;
         q.GetDevice(&mut dev).ok()?;
-        let f: ID3D12Fence = dev?.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        let f: ID3D12Fence = super::real::create_raw_fence(&dev?).ok()?;
         m.insert(key, (f, 0));
     }
     let e = m.get_mut(&key)?;
@@ -2611,7 +2611,7 @@ impl State {
         for (key, q) in active {
             let entry = match self.queue_fences.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+                std::collections::hash_map::Entry::Vacant(e) => match super::real::create_raw_fence(&self.dev) {
                     Ok(fence) => e.insert((fence, 0)),
                     Err(_) => return None,
                 },
