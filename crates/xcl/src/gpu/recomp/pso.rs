@@ -945,13 +945,13 @@ fn direct_fallback(stage: &str, err: &str) {
     crate::xlog_info!("[SHADER] direct DXIL fallback stage={stage} reason=\"{reason}\" detail=\"{}\" – HLSL path", err.lines().next().unwrap_or(""));
 }
 
-/// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
-/// FSPX (driver) containers are left to the HLSL path.
 /// Whether the compact form may take its larger tables: on a GPU with 32-lane waves only, or with heap memory windows.
 fn large_tables(split_wave64: bool, windows: u32) -> bool {
     split_wave64 || windows & super::HEAP_WINDOWS != 0
 }
 
+/// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
+/// FSPX (driver) containers are left to the HLSL path.
 fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
