@@ -947,6 +947,11 @@ fn direct_fallback(stage: &str, err: &str) {
 
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
+/// Whether the compact form may take its larger tables: on a GPU with 32-lane waves only, or with heap memory windows.
+fn large_tables(split_wave64: bool, windows: u32) -> bool {
+    split_wave64 || windows & super::HEAP_WINDOWS != 0
+}
+
 fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
@@ -969,7 +974,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             }
         }
     }
-    let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
+    let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, large_tables(split_wave64, windows))?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -1378,6 +1383,20 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
         D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(|e| format!("{e}"))?;
         let blob = blob.ok_or("root signature")?;
         dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())).map_err(|e| format!("CreateRootSignature: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod large_table_tests {
+    use super::large_tables;
+    use crate::gpu::recomp::HEAP_WINDOWS;
+
+    #[test]
+    fn a_gpu_with_64_lane_waves_takes_the_larger_tables_only_with_heap_windows() {
+        assert!(large_tables(true, 4));
+        assert!(large_tables(true, 4 | HEAP_WINDOWS));
+        assert!(large_tables(false, 4 | HEAP_WINDOWS));
+        assert!(!large_tables(false, 4));
     }
 }
 
