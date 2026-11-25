@@ -1473,6 +1473,7 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
+    let reads = if gpu_view::on() { gpu_view::reads_due() } else { Vec::new() };
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     // the title's work sees what was decommitted unmapped, as it was
@@ -1526,7 +1527,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         s.upload_dirty(&dirty_runs);
     }
     if gpu_view::on() {
-        gpu_view::sync(s, dirty);
+        gpu_view::sync(s, dirty, &reads);
     }
     PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
     {

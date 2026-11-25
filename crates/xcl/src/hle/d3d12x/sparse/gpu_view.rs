@@ -170,6 +170,12 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
             *MIRRORS.lock().unwrap().get_or_insert_with(Mirrors::default).extents.entry((first, n)).or_insert(w)
         }
     };
+    // before STATE: kernelx holds its pages while it commits sparse tiles
+    let unseen: Vec<usize> = {
+        let mg = MIRRORS.lock().unwrap();
+        (t0..t1).step_by(TILE).filter(|t| !mg.as_ref().is_some_and(|m| m.title_of.contains_key(&(win + (t - first))))).collect()
+    };
+    let reads: FxHashMap<usize, usize> = unseen.into_iter().map(|t| (t, super::super::title_textures::mirror_source(t))).collect();
     // (held: STATE, then MIRRORS, as in `sync`)
     let mut g = lock_state();
     let s = g.as_mut()?;
@@ -191,11 +197,11 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
             }
             let (a, b) = (new[i], win + (new[i] - first));
             // SAFETY: the tiles are address space of a window, with no CPU memory behind them
-            unsafe { s.ensure_mapped(b, (j - i) * TILE, |w| query_tile_holes(super::super::title_textures::mirror_source(a + (w - b)))) };
+            unsafe { s.ensure_mapped(b, (j - i) * TILE, |w| query_tile_holes(reads[&(a + (w - b))])) };
             for &t in &new[i..j] {
                 let w = win + (t - first);
                 if s.mapped.contains_key(&w) {
-                    m.show(w, t, super::super::title_textures::mirror_source(t) & !(TILE - 1));
+                    m.show(w, t, reads[&t] & !(TILE - 1));
                 }
             }
             i = j;
@@ -217,23 +223,33 @@ pub fn sources() -> Vec<(usize, usize)> {
     MIRRORS.lock().unwrap().as_ref().map_or(Vec::new(), |m| m.by_read.keys().map(|&r| (r, r + TILE)).collect())
 }
 
-/// `State::mirror_up` for a submit (`before_execute`; `s` is the locked state). A page the title
-/// mapped elsewhere or now has no mapping at all is looked at again when the mappings of a GPU
-/// view change, and a few tiles in turn otherwise.
-pub(super) unsafe fn sync(s: &mut State, dirty: &[usize]) {
+/// The title tiles `sync` looks at again now, with where their bytes are read from: all of them
+/// when the mappings of a GPU view changed, a few in turn otherwise. Before the state's lock
+/// (kernelx holds its pages while it commits sparse tiles).
+pub(super) fn reads_due() -> Vec<(usize, usize)> {
+    let look: Vec<usize> = {
+        let mut g = MIRRORS.lock().unwrap();
+        let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return Vec::new() };
+        let gen = crate::hle::kernelx::gpu_view_map_gen();
+        let titles: Vec<usize> = m.read.keys().copied().collect();
+        let look = if std::mem::replace(&mut m.gen, gen) != gen {
+            titles
+        } else {
+            let n = titles.len().max(1);
+            (0..8.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
+        };
+        m.turn = m.turn.wrapping_add(8);
+        look
+    };
+    look.into_iter().map(|t| (t, super::super::title_textures::mirror_source(t) & !(TILE - 1))).collect()
+}
+
+/// `State::mirror_up` for a submit (`before_execute`; `s` is the locked state), with the read
+/// sources of `reads_due`.
+pub(super) unsafe fn sync(s: &mut State, dirty: &[usize], reads: &[(usize, usize)]) {
     let mut g = MIRRORS.lock().unwrap();
     let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return };
-    let gen = crate::hle::kernelx::gpu_view_map_gen();
-    let titles: Vec<usize> = m.read.keys().copied().collect();
-    let look: Vec<usize> = if std::mem::replace(&mut m.gen, gen) != gen {
-        titles
-    } else {
-        let n = titles.len().max(1);
-        (0..8.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
-    };
-    m.turn = m.turn.wrapping_add(8);
-    for t in look {
-        let r = super::super::title_textures::mirror_source(t) & !(TILE - 1);
+    for &(t, r) in reads {
         m.set_read(t, r);
     }
     let n = s.mirror_up(m, dirty);
