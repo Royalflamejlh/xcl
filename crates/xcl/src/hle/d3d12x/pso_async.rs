@@ -361,6 +361,10 @@ fn drop_unstarted_job(p: &Pending) {
     }
 }
 
+/// The stack of the threads that build pipelines: translation recurses deeply on big programs,
+/// and the driver compiles on the calling thread (`xcl shaders` builds on the same)
+pub const WORKER_STACK: usize = 16 << 20;
+
 type Work = Box<dyn FnOnce() + Send>;
 
 struct PsoWork {
@@ -459,7 +463,7 @@ fn queue() -> &'static Arc<PsoQueue> {
         let n = pso_worker_threads();
         for k in 0..n {
             let q = q.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(16 << 20).spawn(move || loop {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(WORKER_STACK).spawn(move || loop {
                 while let Some(p) = next_needed() {
                     build_queued(&p);
                 }
@@ -1208,7 +1212,7 @@ fn preload() -> Option<&'static Preload> {
     STARTED.call_once(|| {
         let n = preload_worker_threads();
         for k in 0..n {
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(16 << 20).spawn(move || {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(WORKER_STACK).spawn(move || {
                 unsafe {
                     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
                     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
