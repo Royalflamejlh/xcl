@@ -273,6 +273,14 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
 unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMut(*mut c_void) -> HRESULT) -> Option<HRESULT> {
     let a = alloc as usize;
+    // (a put-aside one keeps what was recorded on it until its own reset)
+    for f in s.aside.get(&a).cloned().unwrap_or_default() {
+        if s.backings.get(&f).is_some_and(|b| !b.marks.is_empty() && b.free()) && reset(f as *mut c_void) >= 0 {
+            if let Some(b) = s.backings.get_mut(&f) {
+                b.marks.clear();
+            }
+        }
+    }
     let c = s.cur.get(&a).copied().unwrap_or(a);
     if s.backings.get(&c).is_none_or(|b| b.free()) {
         if let Some(b) = s.backings.get_mut(&c) {
@@ -368,6 +376,50 @@ mod tests {
         assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
         assert_eq!(s.of_list.get(&list), Some(&alloc), "the earlier recording stays on its original backing");
         assert_eq!((s.made, s.swaps), (0, 1));
+    }
+
+    #[test]
+    fn a_put_aside_allocator_is_reset_once_its_gpu_work_is_done() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn release(_: *mut c_void) -> u32 {
+            0
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(5) };
+        let mark = |v: u64| (unsafe { ID3D12Fence::from_raw(std::ptr::from_ref(&fence).cast_mut().cast()) }, v);
+
+        let (alloc, current, done, running) = (0x1000usize, 0x2000usize, 0x3000usize, 0x4000usize);
+        let mut s = State::default();
+        s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        s.cur.insert(alloc, current);
+        s.aside.insert(alloc, vec![done, running]);
+        s.backings.insert(current, Backing::default());
+        s.backings.insert(done, Backing { marks: HashMap::from([(1, mark(5))]), ..Default::default() });
+        s.backings.insert(running, Backing { marks: HashMap::from([(1, mark(9))]), ..Default::default() });
+        let mut calls = Vec::new();
+        let hr = unsafe { title_reset_in(&mut s, alloc as *mut c_void, |raw| { calls.push(raw as usize); 0 }) };
+        assert_eq!(hr, Some(0));
+        assert_eq!(calls, vec![done, current]);
+        assert!(s.backings[&done].marks.is_empty() && !s.backings[&running].marks.is_empty());
+
+        let hr = unsafe { title_reset_in(&mut s, alloc as *mut c_void, |raw| { calls.push(raw as usize); 0 }) };
+        assert_eq!(hr, Some(0));
+        assert_eq!(calls, vec![done, current, current]);
     }
 
     /// Final-release cleanup drops only the recording's hold: another live list and a pending
