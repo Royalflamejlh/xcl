@@ -2358,7 +2358,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                         return;
                     }
                     Err(e) => {
-                        crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
+                        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 4 || n.is_power_of_two() {
+                            crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e} ({n} so far)");
+                        }
                         ei_work(this, sig, super::targets::SKIPPED);
                         count(DISPATCHES_SKIPPED);
                         return;

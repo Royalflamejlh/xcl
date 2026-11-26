@@ -45,7 +45,7 @@ struct PipelineBuilder {
 }
 
 impl PipelineBuilder {
-    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Option<ID3D12PipelineState> {
+    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Result<ID3D12PipelineState, HRESULT> {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
         let (hr, in_driver, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
@@ -60,7 +60,7 @@ impl PipelineBuilder {
                 in_driver.as_millis()
             );
         }
-        (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
+        if hr >= 0 && !raw.is_null() { Ok(ID3D12PipelineState::from_raw(raw)) } else { Err(hr) }
     }
 }
 
@@ -69,8 +69,9 @@ struct Chain {
     tail: Vec<ID3D12PipelineState>,
     words: u32,
     whole_code: Vec<u8>,
-    whole: OnceLock<ID3D12PipelineState>,
-    build_whole: Mutex<()>,
+    whole: OnceLock<Option<ID3D12PipelineState>>,
+    /// after a whole build that ran out of memory: when it may be tried, once more
+    retry_at: Mutex<Option<std::time::Instant>>,
     /// a thread of its own builds the whole form (`whole_ready`)
     whole_sent: std::sync::atomic::AtomicBool,
 }
@@ -81,17 +82,33 @@ unsafe impl Send for ChainRef {}
 
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
+        if let Some(p) = self.whole.get() { return p.clone().ok_or_else(|| "whole compute pipeline".into()); }
+        let mut retry_at = self.retry_at.lock().unwrap();
+        if let Some(p) = self.whole.get() { return p.clone().ok_or_else(|| "whole compute pipeline".into()); }
+        if retry_at.is_some_and(|t| std::time::Instant::now() < t) { return Err(OUT_OF_MEMORY.into()); }
         // (a driver compile on the title's thread, of the largest programs: the title is held
         // while it lasts, as in any other long PC call)
         let _call = super::super::pso_async::pc_call();
-        let _guard = self.build_whole.lock().unwrap();
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
-        let _ = self.whole.set(p.clone());
-        Ok(p)
+        match self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)) {
+            Ok(p) => {
+                let _ = self.whole.set(Some(p.clone()));
+                Ok(p)
+            }
+            Err(hr) if hr == crate::util::E_OUTOFMEMORY && retry_at.is_none() => {
+                *retry_at = Some(std::time::Instant::now() + WHOLE_RETRY);
+                Err(OUT_OF_MEMORY.into())
+            }
+            Err(_) => {
+                let _ = self.whole.set(None);
+                Err("whole compute pipeline".into())
+            }
+        }
     }
 }
+
+/// How long a split program's whole form waits after a build that ran out of memory, before its last try
+const WHOLE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+const OUT_OF_MEMORY: &str = "whole compute pipeline: out of memory";
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
 
@@ -116,7 +133,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), whole_sent: Default::default() });
+        whole_code: whole.to_vec(), whole: OnceLock::new(), retry_at: Mutex::new(None), whole_sent: Default::default() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -149,12 +166,12 @@ pub(in crate::hle::d3d12x) enum Whole {
 /// by a thread of its own, once, and until it is there its dispatches are left out as those of
 /// any late compute pipeline. Built in the call, a retail title's render thread stood in the
 /// driver's compiler for it (1.1 MB of DXIL) and every other thread that dispatched it stood
-/// behind `build_whole`: no frame for over two minutes after its first world frame.
+/// behind the whole build's lock: no frame for over two minutes after its first world frame.
 pub(in crate::hle::d3d12x) unsafe fn whole_ready(pso: usize) -> Result<Whole, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     let Some(chain) = chain else { return Ok(Whole::Plain) };
     if let Some(p) = chain.whole.get() {
-        return Ok(Whole::Ready(p.clone()));
+        return p.clone().map(Whole::Ready).ok_or_else(|| "whole compute pipeline".into());
     }
     if !super::super::pso_async::cs_goes_on() {
         return chain.whole().map(Whole::Ready);
@@ -164,7 +181,12 @@ pub(in crate::hle::d3d12x) unsafe fn whole_ready(pso: usize) -> Result<Whole, St
         // (named as the pipeline workers: a huge compile takes its turn at the gate)
         let spawned = std::thread::Builder::new().name("xcl-pso-whole".into()).stack_size(64 << 20).spawn(move || {
             let job = job;
-            if let Err(e) = unsafe { job.0.whole() } {
+            let mut built = unsafe { job.0.whole() };
+            if built.as_ref().is_err_and(|e| e == OUT_OF_MEMORY) {
+                std::thread::sleep(WHOLE_RETRY);
+                built = unsafe { job.0.whole() };
+            }
+            if let Err(e) = built {
                 crate::xlog_warn!("D3D12.X: the whole form of a split compute program was not built ({e}): its indirect dispatches stay left out");
             }
         });
@@ -314,7 +336,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_bytes, LEAST};
+    use super::*;
 
     const MB: u64 = 1 << 20;
 
@@ -362,5 +384,51 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    #[test]
+    fn a_whole_form_that_fails_to_build_is_not_built_again() {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "system" fn refused(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::util::E_FAIL
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let signature = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
+            let builder = Arc::new(PipelineBuilder { device: dev, create: refused, signature, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let chain = Chain { builder, tail: Vec::new(), words: 4, whole_code: vec![0; 16], whole: OnceLock::new(), retry_at: Mutex::new(None), whole_sent: Default::default() };
+            assert!(chain.whole().is_err());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn a_whole_form_that_ran_out_of_memory_is_tried_once_more_after_a_pause() {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "system" fn out_of_memory(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::util::E_OUTOFMEMORY
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let signature = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
+            let builder = Arc::new(PipelineBuilder { device: dev, create: out_of_memory, signature, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let chain = Chain { builder, tail: Vec::new(), words: 4, whole_code: vec![0; 16], whole: OnceLock::new(), retry_at: Mutex::new(None), whole_sent: Default::default() };
+            assert!(chain.whole().is_err());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+            *chain.retry_at.lock().unwrap() = Some(std::time::Instant::now());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+            *chain.retry_at.lock().unwrap() = Some(std::time::Instant::now());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+        }
     }
 }
