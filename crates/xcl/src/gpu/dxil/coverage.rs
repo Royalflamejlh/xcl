@@ -250,11 +250,11 @@ pub fn percentiles(v: &[u64]) -> (u64, u64, u64) {
 /// after the program (`xbox::Fssm::rodata`).
 pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool, rodata: &[(u32, Vec<u32>)]) -> Result<Vec<u8>, String> {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
-        Mode::Kernel => kernel::translate_entry_rodata(code, o, kernel::Entry::Kernel, rodata),
-        Mode::Compute(cs) => kernel::translate_entry_rodata(code, o, kernel::Entry::Compute(cs.clone()), rodata),
-        Mode::Vertex(vs) => kernel::translate_entry_rodata(code, KernelOptions { split: false, ..o }, kernel::Entry::Vertex(vs.clone()), rodata),
-        Mode::Pixel(ps) => kernel::translate_entry_rodata(code, KernelOptions { split: false, ..o }, kernel::Entry::Pixel(ps.clone()), rodata),
-        Mode::Mesh(ms) => kernel::translate_entry_rodata(code, o, kernel::Entry::Mesh(ms.clone()), rodata),
+        Mode::Kernel => kernel::translate_entry_rodata(code, o, kernel::Entry::Kernel, true, rodata),
+        Mode::Compute(cs) => kernel::translate_entry_rodata(code, o, kernel::Entry::Compute(cs.clone()), true, rodata),
+        Mode::Vertex(vs) => kernel::translate_entry_rodata(code, KernelOptions { split: false, ..o }, kernel::Entry::Vertex(vs.clone()), true, rodata),
+        Mode::Pixel(ps) => kernel::translate_entry_rodata(code, KernelOptions { split: false, ..o }, kernel::Entry::Pixel(ps.clone()), true, rodata),
+        Mode::Mesh(ms) => kernel::translate_entry_rodata(code, o, kernel::Entry::Mesh(ms.clone()), true, rodata),
         Mode::Geometry(g) => kernel::translate_geometry(code, o, g),
     }));
     let k = match r {

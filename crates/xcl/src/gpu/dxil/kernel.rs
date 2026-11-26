@@ -38,7 +38,7 @@ pub struct KernelOptions {
 /// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
 /// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 12;
+pub const TRANSLATOR_VERSION: u32 = 13;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -180,11 +180,14 @@ fn translate_entry(
 /// A program at `entry` with the constant data the console compiler put after it in the code
 /// region (`xbox::Fssm::rodata`, the recompiler's `Options::rodata`): `s_getpc_b64` plus the
 /// compiler's offset is its address, and dword loads at such an address read the table the
-/// module carries (`Lw::rodata_loads`). The compact tables as `translate_full` /
-/// `translate_compute` take them (a compute program for a GPU with 64-lane waves:
-/// `translate_compute_rodata`).
-pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
-    let (compact, tables) = if matches!(entry, Entry::Kernel | Entry::Compute(_)) { (compact_mode(), super::compact::TABLE_WORDS_WAVE32) } else { (None, 0) };
+/// module carries (`Lw::rodata_loads`). `wave32_only`: as `translate_compute_on` (compute only).
+pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, wave32_only: bool, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
+    let compact = if matches!(entry, Entry::Kernel | Entry::Compute(_)) { compact_mode() } else { None };
+    let tables = match entry {
+        Entry::Compute(_) if !wave32_only => super::compact::TABLE_WORDS,
+        Entry::Kernel | Entry::Compute(_) => super::compact::TABLE_WORDS_WAVE32,
+        _ => 0,
+    };
     translate_entry_with(code, o, entry, compact, None, tables, rodata.to_vec())
 }
 
@@ -251,6 +254,9 @@ fn translate_on_this_thread(
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    if !rodata.is_empty() {
+        lw.code_loads = crate::gpu::recomp::code_loads::code_loads(&cfg.insts);
+    }
     lw.rodata = rodata;
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
@@ -601,6 +607,7 @@ impl Lw {
             fmt_table: None,
             rodata: Vec::new(),
             rodata_table: None,
+            code_loads: BTreeMap::new(),
             fmt_desc_cache: HashMap::new(),
             fmt_comp1_cache: HashMap::new(),
             reload: None,
