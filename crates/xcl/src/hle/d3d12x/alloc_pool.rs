@@ -649,6 +649,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
         }
         Action::ResetCurrent { cur, aside } => {
             let hr = super::real::reset_pc_allocator(cur as *mut c_void);
+            let mut orphan = None;
             {
                 let mut g = STATE.lock().unwrap();
                 if let Some(s) = g.as_mut() {
@@ -659,9 +660,15 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
                             b.already_reset = true;
                         }
                     }
+                    if !s.types.contains_key(&a) && cur != a {
+                        orphan = Some(cur);
+                    }
                 }
             }
             RESET_DONE.notify_all();
+            if let Some(f) = orphan {
+                drop(ID3D12CommandAllocator::from_raw(f as *mut c_void));
+            }
             finish_aside(aside);
             Some(hr)
         }
