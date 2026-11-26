@@ -15,7 +15,7 @@
 //! one recording, so no more allocators are put aside than there are lists.
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -30,11 +30,13 @@ struct Backing {
     marks: HashMap<usize, (ID3D12Fence, u64)>,
     /// true once this backing has been PC-reset while idle and no new recording/submit has touched it
     already_reset: bool,
+    /// true while a thread is running `reset_pc_allocator` on this backing outside `STATE`
+    resetting: bool,
 }
 
 impl Backing {
     unsafe fn free(&self) -> bool {
-        self.users.is_empty() && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
+        !self.resetting && self.users.is_empty() && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
     }
 }
 
@@ -78,6 +80,7 @@ struct LastSubmit {
 unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static RESET_DONE: Condvar = Condvar::new();
 
 /// `XCL_ALLOC_SWAP=0` turns it off.
 pub fn enabled() -> bool {
@@ -127,21 +130,67 @@ pub(super) fn forget_list(list: usize) {
     }
 }
 
-/// Reset `list` on the title's allocator `alloc`, committing its new recording association
-/// only after native Reset succeeds. No pool lock is held across the driver call.
-pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
-    let backing = current(alloc);
-    let hr = reset(backing);
-    if hr < 0 || !enabled() || alloc == 0 {
-        return hr;
+fn try_reserve_backing(s: &mut State, list: usize, alloc: usize, ty: i32) -> Option<(usize, Option<usize>)> {
+    let backing = s.cur.get(&alloc).copied().unwrap_or(alloc);
+    if s.backings.get(&backing).is_some_and(|b| b.resetting) {
+        return None;
     }
-    let mut g = STATE.lock().unwrap();
-    let s = g.get_or_insert_with(State::default);
+    let prev = s.of_list.get(&list).copied();
     if ty >= 0 {
         s.types.insert(alloc, ty);
     }
     move_list(s, list, backing);
-    *s.recordings.entry(list).or_default() += 1;
+    Some((backing, prev))
+}
+
+fn rollback_backing(s: &mut State, list: usize, backing: usize, prev: Option<usize>) {
+    if prev != Some(backing) {
+        if let Some(b) = s.backings.get_mut(&backing) {
+            b.users.remove(&list);
+        }
+    }
+    match prev {
+        Some(old) => {
+            s.of_list.insert(list, old);
+            s.backings.entry(old).or_default().users.insert(list);
+        }
+        None => {
+            s.of_list.remove(&list);
+        }
+    }
+}
+
+/// Reset `list` on the title's allocator `alloc`, committing its new recording association
+/// before native Reset so a concurrent `title_reset` cannot reset the same backing mid-call,
+/// rolling back if native Reset fails. No pool lock is held across the driver call.
+pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
+    if !enabled() || alloc == 0 {
+        return reset(alloc);
+    }
+    let (backing, prev) = {
+        let mut g = STATE.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let s = g.get_or_insert_with(State::default);
+            if let Some(r) = try_reserve_backing(s, list, alloc, ty) {
+                break r;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return crate::util::E_FAIL;
+            }
+            let (ng, _) = RESET_DONE.wait_timeout(g, deadline - now).unwrap();
+            g = ng;
+        }
+    };
+    let hr = reset(backing);
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(State::default);
+    if hr >= 0 {
+        *s.recordings.entry(list).or_default() += 1;
+    } else {
+        rollback_backing(s, list, backing, prev);
+    }
     hr
 }
 
@@ -461,6 +510,7 @@ unsafe fn take_free_aside(s: &mut State, a: usize) -> Vec<usize> {
         let f = v[i];
         if s.backings.get(&f).is_some_and(|b| !b.already_reset && b.free()) {
             ready.push(v.remove(i));
+            s.backings.entry(f).or_default().resetting = true;
         } else {
             i += 1;
         }
@@ -469,12 +519,14 @@ unsafe fn take_free_aside(s: &mut State, a: usize) -> Vec<usize> {
 }
 
 unsafe fn restore_aside(s: &mut State, a: usize, f: usize, ok: bool) -> bool {
-    if ok {
-        if let Some(b) = s.backings.get_mut(&f) {
+    if let Some(b) = s.backings.get_mut(&f) {
+        b.resetting = false;
+        if ok {
             b.marks.clear();
             b.already_reset = true;
         }
     }
+    RESET_DONE.notify_all();
     if s.types.contains_key(&a) {
         s.aside.entry(a).or_default().push(f);
         true
@@ -507,11 +559,8 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
         let c = s.cur.get(&a).copied().unwrap_or(a);
         if s.backings.get(&c).is_none_or(|b| b.free()) {
             let aside = take_free_aside(s, a);
+            s.backings.entry(c).or_default().resetting = true;
             if c == a {
-                if let Some(b) = s.backings.get_mut(&c) {
-                    b.marks.clear();
-                    b.already_reset = true;
-                }
                 Action::CleanPrimary { aside }
             } else {
                 Action::ResetCurrent { cur: c, aside }
@@ -540,6 +589,9 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
                 Some((owner, idx)) => {
                     let spare = s.aside.get_mut(&owner).unwrap().remove(idx);
                     let needs_reset = s.backings.get(&spare).is_none_or(|b| !b.already_reset);
+                    if needs_reset {
+                        s.backings.entry(spare).or_default().resetting = true;
+                    }
                     let aside = take_free_aside(s, a);
                     Action::SwapReuse { cur: c, owner, spare, needs_reset, aside }
                 }
@@ -578,20 +630,38 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
 
     match action {
         Action::CleanPrimary { aside } => {
-            finish_aside(aside);
-            None
-        }
-        Action::ResetCurrent { cur, aside } => {
-            let hr = super::real::reset_pc_allocator(cur as *mut c_void);
-            if hr >= 0 {
+            let hr = super::real::reset_pc_allocator(alloc);
+            {
                 let mut g = STATE.lock().unwrap();
                 if let Some(s) = g.as_mut() {
-                    if let Some(b) = s.backings.get_mut(&cur) {
-                        b.marks.clear();
-                        b.already_reset = true;
+                    if let Some(b) = s.backings.get_mut(&a) {
+                        b.resetting = false;
+                        if hr >= 0 {
+                            b.marks.clear();
+                            b.already_reset = true;
+                        }
                     }
                 }
             }
+            RESET_DONE.notify_all();
+            finish_aside(aside);
+            Some(hr)
+        }
+        Action::ResetCurrent { cur, aside } => {
+            let hr = super::real::reset_pc_allocator(cur as *mut c_void);
+            {
+                let mut g = STATE.lock().unwrap();
+                if let Some(s) = g.as_mut() {
+                    if let Some(b) = s.backings.get_mut(&cur) {
+                        b.resetting = false;
+                        if hr >= 0 {
+                            b.marks.clear();
+                            b.already_reset = true;
+                        }
+                    }
+                }
+            }
+            RESET_DONE.notify_all();
             finish_aside(aside);
             Some(hr)
         }
@@ -607,6 +677,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
                         }
                     } else {
                         if let Some(b) = s.backings.get_mut(&spare) {
+                            b.resetting = false;
                             b.marks.clear();
                             b.already_reset = true;
                         }
@@ -628,6 +699,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
                     }
                 }
             }
+            RESET_DONE.notify_all();
             if let Some(f) = orphan {
                 drop(ID3D12CommandAllocator::from_raw(f as *mut c_void));
             }
@@ -635,10 +707,15 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
             Some(hr)
         }
         Action::SwapNew { cur, ty, aside } => {
-            let this = ID3D12CommandAllocator::from_raw_borrowed(&alloc)?;
-            let mut dev: Option<ID3D12Device> = None;
-            this.GetDevice(&mut dev).ok()?;
-            let made: ID3D12CommandAllocator = dev?.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(ty)).ok()?;
+            let made = ID3D12CommandAllocator::from_raw_borrowed(&alloc).and_then(|this| {
+                let mut dev: Option<ID3D12Device> = None;
+                this.GetDevice(&mut dev).ok()?;
+                dev?.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE(ty)).ok()
+            });
+            let Some(made) = made else {
+                finish_aside(aside);
+                return None;
+            };
             let raw = made.into_raw();
             if !super::real::is_adopted(raw) {
                 super::real::adopt(raw, super::real::Kind::CommandAllocator);
@@ -1146,5 +1223,93 @@ mod tests {
             forget_list(list);
             forget(alloc);
         }
+    }
+
+    #[test]
+    fn reset_list_blocks_concurrent_title_reset_and_rolls_back_on_failure() {
+        let mut ids = Box::new([0u8; 3]);
+        let base = ids.as_mut_ptr() as usize;
+        let (alloc, spare, list) = (base, base + 1, base + 2);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            s.aside.insert(alloc, vec![spare]);
+            s.backings.insert(spare, Backing::default());
+        }
+
+        let mut mid_reset_calls = Vec::new();
+        let hr = reset_list(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |backing| {
+            assert_eq!(backing, alloc);
+            // While `reset_list` is inside native Reset, `alloc` must already be pinned by `list`
+            // so a concurrent `title_reset` swaps to `spare` instead of resetting `alloc`.
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            assert!(s.backings[&alloc].users.contains(&list));
+            assert!(!unsafe { s.backings[&alloc].free() });
+            let r = unsafe {
+                title_reset_in(s, alloc as *mut c_void, |raw| {
+                    mid_reset_calls.push(raw as usize);
+                    0
+                })
+            };
+            assert_eq!(r, Some(0));
+            crate::util::E_FAIL
+        });
+
+        assert_eq!(hr, crate::util::E_FAIL);
+        assert_eq!(mid_reset_calls, vec![spare], "concurrent title_reset must not reset the backing mid-reset_list");
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            assert!(!s.of_list.contains_key(&list), "failed reset_list must roll back of_list");
+            assert!(!s.backings[&alloc].users.contains(&list), "failed reset_list must roll back backing.users");
+            assert_eq!(s.recordings.get(&list).copied().unwrap_or(0), 0, "failed reset_list must not bump recordings");
+            // Clean up synthetic non-COM spare before forget.
+            s.cur.remove(&alloc);
+            s.aside.remove(&alloc);
+            s.backings.remove(&spare);
+        }
+        unsafe { forget(alloc) };
+    }
+
+    #[test]
+    fn reset_list_waits_while_backing_is_resetting() {
+        let mut ids = Box::new([0u8; 2]);
+        let base = ids.as_mut_ptr() as usize;
+        let (alloc, list) = (base, base + 1);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            let b = s.backings.entry(alloc).or_default();
+            b.resetting = true;
+            assert!(!unsafe { b.free() }, "a resetting backing must never report free");
+            assert!(try_reserve_backing(s, list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0).is_none());
+        }
+
+        let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleared_bg = cleared.clone();
+        let bg = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            {
+                let mut g = STATE.lock().unwrap();
+                if let Some(b) = g.as_mut().and_then(|s| s.backings.get_mut(&alloc)) {
+                    b.resetting = false;
+                }
+                cleared_bg.store(true, std::sync::atomic::Ordering::Release);
+            }
+            RESET_DONE.notify_all();
+        });
+
+        let hr = reset_list(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |backing| {
+            assert_eq!(backing, alloc);
+            assert!(cleared.load(std::sync::atomic::Ordering::Acquire), "reset_list must not hand out backing before resetting clears");
+            0
+        });
+        bg.join().unwrap();
+        assert_eq!(hr, 0);
+        forget_list(list);
+        unsafe { forget(alloc) };
     }
 }
