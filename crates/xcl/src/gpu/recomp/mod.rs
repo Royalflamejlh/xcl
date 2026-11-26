@@ -52,6 +52,7 @@
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
 pub mod cfg;
+pub mod code_loads;
 pub mod dxc;
 pub mod dxil;
 pub mod lane_masks;
@@ -228,9 +229,11 @@ pub const IO_GROUP_LIMIT: usize = 113;
 /// Groups a folded dispatch has in X.
 pub const FOLD_X: u32 = 65_535;
 /// High dword `s_getpc_b64` gives a program that has constant data in its code region
-/// (`Options::rodata`) and several memory windows: its code addresses are then above every
+/// (`Options::rodata`) and a load that may or may not read it (`code_loads::CodeLoad::Maybe`),
+/// with any number of memory windows: its code addresses are then above every
 /// address a title can have (user space ends at 0x7FFF_FFFF_FFFF), so a load from the data is
-/// told from a load of the title's memory at the same low dword (descriptor tables in window 0).
+/// told from a load of the title's memory at the same low dword (descriptor tables in window 0,
+/// any memory with one window, which ignores the high dword).
 pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
 
 impl GsInterface {
@@ -1827,6 +1830,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders, matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)));
+    if !opt.rodata.is_empty() {
+        em.code_loads = code_loads::code_loads(&insts);
+    }
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits
