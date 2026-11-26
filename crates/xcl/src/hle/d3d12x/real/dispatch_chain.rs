@@ -20,6 +20,8 @@ static INDIRECT_WHOLE: AtomicU64 = AtomicU64::new(0);
 static INDIRECT_LOST: AtomicU64 = AtomicU64::new(0);
 /// ExecuteIndirects that ran the whole form (not chainable)
 static WHOLE_INDIRECT: AtomicU64 = AtomicU64::new(0);
+/// recordings made (`RECORDINGS`)
+static RECORDED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn log_counts() {
     let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
@@ -27,6 +29,16 @@ pub(crate) fn log_counts() {
     crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab); ExecuteIndirect: {} chained ({} of them whole, {} slabs lost), {} whole",
         n(&PROGRAMS), n(&PIECES), n(&DISPATCHES), n(&SLABS), mib(&LIVE), mib(&PEAK), mib(&WANTED),
         n(&INDIRECT), n(&INDIRECT_WHOLE), n(&INDIRECT_LOST), n(&WHOLE_INDIRECT));
+    // what holds the recordings still kept: they go when their PC allocator is reset or, put aside, is free
+    let (keys, held) = {
+        let r = RECORDINGS.lock().unwrap();
+        let keys: Vec<(usize, usize)> = r.iter().map(|(&a, v)| (a, v.len())).collect();
+        let held = keys.iter().map(|&(_, n)| n).sum::<usize>();
+        (keys, held)
+    };
+    let [users, gpu, free, busy, idle, unknown] = super::super::alloc_pool::holds(&keys);
+    crate::xlog_info!("compute split: {held} of {} recordings held, under {} PC allocators: put aside with a list on it {users}, put aside with submits on the GPU {gpu}, put aside and free {free}; in use and busy {busy}, in use and free {idle}; not the pool's {unknown}",
+        n(&RECORDED), keys.len());
 }
 
 /// The scratch a dispatch uses at once, `XCL_SPLIT_SCRATCH_MB` (256): more groups than fit run in
@@ -67,9 +79,7 @@ struct Chain {
     waiting: std::sync::atomic::AtomicUsize,
     /// its command signature for ExecuteIndirect (`pso::chain_command_signature`)
     signature: OnceLock<ID3D12CommandSignature>,
-    /// the most slabs one of its ExecuteIndirects had, the last one read back, and whether one
-    /// was read back yet
-    slabs: std::sync::atomic::AtomicU32,
+    /// the slabs of the last of its ExecuteIndirects read back, and whether one was read back yet
     last: std::sync::atomic::AtomicU32,
     measured: std::sync::atomic::AtomicBool,
     /// its whole form was asked for in the background / a lost slab was reported
@@ -99,14 +109,17 @@ impl Chain {
     /// The whole form built on another thread, for a later ExecuteIndirect with more slabs than rounds
     fn want_whole(self: &Arc<Self>) {
         if !self.wanted.swap(true, Ordering::Relaxed) {
-            let chain = self.clone();
-            whole_thread().spawn(move || unsafe {
+            let len = self.whole_code.len();
+            let lane = if len >= GIANT_DRIVER_COMPILE { 2 } else if len >= huge_pso_bytes() { 1 } else { 0 };
+            WHOLE_BUILDS[lane].push(Arc::downgrade(self), |chain| unsafe {
+                // (a program released before its turn is not built)
+                let Some(chain) = chain.upgrade() else { return };
                 let waited = chain.clone();
                 let built = super::super::pso_async::build_waited_on(move || waited.waiting.load(Ordering::Acquire) > 0, || {
                     if chain.whole.get().is_some() { Ok(()) } else { chain.build_whole_form().map(drop) }
                 });
                 if let Err(e) = built { crate::xlog_warn!("D3D12.X: whole form of a split program: {e}"); }
-            }).ok();
+            });
         }
     }
 }
@@ -116,6 +129,44 @@ impl Chain {
 fn whole_thread() -> std::thread::Builder {
     std::thread::Builder::new().name("xcl-pso-chain-whole".into())
 }
+
+/// Work done one item after another on one thread of `whole_thread`'s, started when there is
+/// some and none is running.
+struct InTurn<T> {
+    queue: Mutex<(std::collections::VecDeque<T>, bool)>,
+    /// threads started so far
+    started: AtomicU64,
+}
+
+impl<T: Send + 'static> InTurn<T> {
+    const fn new() -> Self {
+        Self { queue: Mutex::new((std::collections::VecDeque::new(), false)), started: AtomicU64::new(0) }
+    }
+
+    fn push(&'static self, item: T, run: fn(T)) {
+        let mut q = self.queue.lock().unwrap();
+        q.0.push_back(item);
+        if std::mem::replace(&mut q.1, true) { return; }
+        drop(q);
+        self.started.fetch_add(1, Ordering::Relaxed);
+        let spawned = whole_thread().spawn(move || loop {
+            let next = {
+                let mut q = self.queue.lock().unwrap();
+                let next = q.0.pop_front();
+                q.1 = next.is_some();
+                next
+            };
+            match next { Some(item) => run(item), None => return }
+        });
+        // (the next push tries again)
+        if spawned.is_err() { self.queue.lock().unwrap().1 = false; }
+    }
+}
+
+/// The whole forms `want_whole` asked for, one lane for each slot set of `driver_compile` (small
+/// ones are never gated, huge and giant ones take their turns): a thread of their own for each
+/// would wait for its turn as well, and a title had 200 such threads, 199 of them waiting (#2404).
+static WHOLE_BUILDS: [InTurn<std::sync::Weak<Chain>>; 3] = [InTurn::new(), InTurn::new(), InTurn::new()];
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
 
@@ -141,7 +192,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
         whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(),
-        slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
+        last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -200,7 +251,6 @@ impl Recording {
         if unsafe { i.commands.Map(0, Some(&range), Some(&mut p)) }.is_err() { return; }
         let [partial, _, slabs, _] = unsafe { std::ptr::read_volatile((p as *const u8).add(i.at as usize) as *const [u32; 4]) };
         unsafe { i.commands.Unmap(0, Some(&D3D12_RANGE::default())) };
-        self.chain.slabs.fetch_max(slabs, Ordering::Relaxed);
         self.chain.last.store(slabs, Ordering::Relaxed);
         self.chain.measured.store(true, Ordering::Relaxed);
         if partial == 0 { return; }
@@ -344,6 +394,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
     let held = Arc::new(Recording { scratch, first, chain, indirect: None });
+    RECORDED.fetch_add(1, Ordering::Relaxed);
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
@@ -369,12 +420,13 @@ fn indirect_rounds(seen: &[[u32; 3]], most: u64, before: Option<u32>, cap: u32) 
     (want + want.div_ceil(4)).clamp(2, u64::from(cap.max(2))) as u32
 }
 
-/// The slabs of an earlier ExecuteIndirect of the program for `indirect_rounds` (None: none was
-/// read back yet). Until its whole form is built, the most any had: slabs past the rounds are
-/// lost. Then the last one's, as more run the whole form: every round costs its pieces'
-/// ExecuteIndirects, also when empty (each ~14 us of GPU after its barrier on an RTX 5070 Ti, #2404).
-fn slabs_before(measured: bool, whole: bool, most: u32, last: u32) -> Option<u32> {
-    measured.then_some(if whole { last } else { most })
+/// The slabs of an earlier ExecuteIndirect of the program for `indirect_rounds`: None (the most
+/// rounds) until one was read back and its whole form is built, as slabs past the rounds are
+/// lost until then (one program's first ExecuteIndirects had a slab, a later one 22, #2404). Then
+/// the last one's, as more run the whole form: every round costs its pieces' ExecuteIndirects,
+/// also when empty (each ~14 us of GPU after its barrier on an RTX 5070 Ti, #2404).
+fn slabs_before(measured: bool, whole: bool, last: u32) -> Option<u32> {
+    (measured && whole).then_some(last)
 }
 
 /// An ExecuteIndirect of split program `pso` whose command signature is one Dispatch of `stride`
@@ -404,7 +456,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
         None => { let s = pso::chain_command_signature(dev, &chain.builder.signature)?; chain.signature.get_or_init(|| s).clone() }
     };
     let full = chain.whole.get().cloned().map(|p| pso::dispatch_command_signature(dev).map(|s| (p, s))).transpose()?;
-    let before = slabs_before(chain.measured.load(Ordering::Relaxed), full.is_some(), chain.slabs.load(Ordering::Relaxed), chain.last.load(Ordering::Relaxed));
+    let before = slabs_before(chain.measured.load(Ordering::Relaxed), full.is_some(), chain.last.load(Ordering::Relaxed));
     let rounds = indirect_rounds(seen, most, before, most_rounds());
     let pieces = chain.tail.len() as u32 + 1;
     let buffer = pso::chain_commands_buffer(dev, rounds, pieces, commands).ok_or("no buffer for the commands of a chained ExecuteIndirect")?;
@@ -430,6 +482,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
         pso::record_dispatch_chain_indirect(list, &sig, &buffer, rounds, &scratch.buffer, std::iter::once(&first).chain(&chain.tail));
     }
     let indirect = Indirect { commands: buffer, at, rounds, whole: full.is_some(), checked: bound.is_ok() && !predicated };
+    RECORDED.fetch_add(1, Ordering::Relaxed);
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording { scratch, first, chain, indirect: Some(indirect) }));
     bound?;
     INDIRECT.fetch_add(1, Ordering::Relaxed);
@@ -505,14 +558,15 @@ mod tests {
     #[test]
     fn once_the_whole_form_is_built_the_last_execute_indirect_sizes_the_rounds() {
         use super::{indirect_rounds, slabs_before};
-        assert_eq!(slabs_before(false, true, 17, 1), None);
-        // not built: the most slabs any had, so that none are lost
-        assert_eq!(slabs_before(true, false, 17, 1), Some(17));
-        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, false, 17, 1), 32), 22);
+        assert_eq!(slabs_before(false, true, 1), None);
+        // not built: the most rounds, also after one of a slab was read back (a later one can
+        // have 22, whose slabs past the rounds would be lost)
+        assert_eq!(slabs_before(true, false, 1), None);
+        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, false, 1), 32), 32);
         // built: the last one's, an overflow runs the whole form
-        assert_eq!(slabs_before(true, true, 17, 1), Some(1));
-        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, true, 17, 1), 32), 2);
-        assert_eq!(indirect_rounds(&[[3, 1, 1]], 1, slabs_before(true, true, 17, 1), 32), 4);
+        assert_eq!(slabs_before(true, true, 1), Some(1));
+        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, true, 1), 32), 2);
+        assert_eq!(indirect_rounds(&[[3, 1, 1]], 1, slabs_before(true, true, 1), 32), 4);
     }
 
     #[test]
@@ -547,7 +601,7 @@ mod tests {
             let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
             let pso = first.as_raw() as usize;
             CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
-                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
+                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
@@ -590,6 +644,38 @@ mod tests {
     /// turn (`big_compile_turn`, every background slot taken) does not wait behind that turn: the
     /// build is then one the title waits for, with the wanted cap and no commit wait (#2404)
     #[test]
+    fn whole_forms_wanted_together_are_built_one_after_another_on_one_thread() {
+        use super::InTurn;
+        use std::sync::{atomic::Ordering, Mutex};
+        static TURNS: InTurn<u32> = InTurn::new();
+        static GATE: Mutex<()> = Mutex::new(());
+        static RAN: Mutex<Vec<(u32, Option<String>)>> = Mutex::new(Vec::new());
+        let gate = GATE.lock().unwrap();
+        for i in 0..5 {
+            TURNS.push(i, |i| {
+                drop(GATE.lock().unwrap());
+                RAN.lock().unwrap().push((i, std::thread::current().name().map(String::from)));
+            });
+        }
+        let started = TURNS.started.load(Ordering::Relaxed);
+        drop(gate);
+        let t = std::time::Instant::now();
+        while RAN.lock().unwrap().len() < 5 && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ran = RAN.lock().unwrap().clone();
+        assert_eq!(started, 1, "a thread for each of 5 whole forms");
+        assert_eq!(ran, (0..5).map(|i| (i, Some("xcl-pso-chain-whole".to_string()))).collect::<Vec<_>>());
+        // the thread ends with the queue; the next one starts another
+        let t = std::time::Instant::now();
+        while TURNS.queue.lock().unwrap().1 && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        TURNS.push(5, |i| RAN.lock().unwrap().push((i, None)));
+        assert_eq!(TURNS.started.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn a_title_thread_does_not_wait_behind_a_background_whole_build_waiting_for_its_turn() {
         use super::*;
         use std::time::{Duration, Instant};
@@ -607,7 +693,7 @@ mod tests {
             let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
             code[..16].copy_from_slice(&nonce.to_le_bytes());
             let chain = Arc::new(Chain { builder, tail: Vec::new(), words: 4, whole_code: code, whole: OnceLock::new(),
-                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
+                build_whole: Mutex::new(()), waiting: Default::default(), signature: OnceLock::new(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
             let held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
             chain.want_whole();
             let started = Instant::now();
