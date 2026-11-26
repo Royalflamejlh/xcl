@@ -1059,7 +1059,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             }
         }
     }
-    let k = crate::gpu::dxil::kernel::translate_compute_rodata(code, o, &cs, &rodata)?;
+    let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Compute(cs), &rodata)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil.into(), samplers: k.static_samplers })
 }
@@ -1800,6 +1800,19 @@ mod shader_cache_tests {
         assert_eq!(a, translated::identity_for("source-a", "dxc-a"));
         assert_ne!(a, translated::identity_for("source-b", "dxc-a"));
         assert_ne!(a, translated::identity_for("source-a", "dxc-b"));
+    }
+
+    /// Which loads read the constant data in the code (`code_loads`, over `cfg::Cfg`) decides
+    /// the HLSL and the direct translations alike: both files are in the translator's source
+    /// hash, so a change to them is another identity.
+    #[test]
+    fn translated_identity_tracks_the_code_load_analysis() {
+        let build = include_str!("../../../build.rs");
+        let list = &build[build.find("const TRANSLATOR_SOURCES").unwrap()..];
+        let list = &list[..list.find("];").unwrap()];
+        for f in ["src/gpu/recomp/code_loads.rs", "src/gpu/recomp/cfg.rs"] {
+            assert!(list.contains(&format!("\"{f}\"")), "{f} is not in build.rs TRANSLATOR_SOURCES");
+        }
     }
 
     #[test]

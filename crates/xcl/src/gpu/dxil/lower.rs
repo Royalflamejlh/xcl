@@ -10,7 +10,7 @@
 //! Variables: SGPR code `c` (0..=127; slot 125 = SCC, as in the kernel ABI),
 //! VGPR `v` = 128 + v, the loop budget = [`VAR_BUDGET`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::module::{BinOp, Block, CastOp, Pred, Value};
 use super::ops::{BitCount, Binary, FClass, FUnary, Tertiary};
@@ -206,6 +206,8 @@ pub struct Lw {
     /// (`rodata_loads`)
     pub rodata: Vec<(u32, Vec<u32>)>,
     pub rodata_table: Option<Value>,
+    /// the loads that may read the constant data, by pc (`recomp::code_loads`)
+    pub code_loads: BTreeMap<u64, crate::gpu::recomp::code_loads::CodeLoad>,
     /// cached decoded format descriptors hoisted to `d3`'s defining block
     pub fmt_desc_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtDesc>,
     /// cached single-component format decode parameters hoisted to `d3`'s defining block
@@ -1340,8 +1342,9 @@ impl Lw {
             return err(d, "indirect branch");
         }
         if name == "s_getpc_b64" {
-            // the code region is addressed from 0 – with constant data after the program and
-            // several memory windows, above them all (`rodata_loads`), as the HLSL kernel
+            // the code region is addressed from 0 – with a load that may or may not read the
+            // constant data after the program, above every memory address (`rodata_loads`), as
+            // the HLSL kernel
             let lo = match self.compact_blk_pc {
                 Some((blk_pc, rep_blk_pc)) => {
                     let rel = (d.pc + d.len as u64).wrapping_sub(rep_blk_pc) as u32;
@@ -1349,7 +1352,8 @@ impl Lw {
                 }
                 None => self.c((d.pc + d.len as u64) as u32),
             };
-            let code_hi = if self.rodata.is_empty() || !self.windowed() { 0 } else { crate::gpu::recomp::CODE_ADDRESS_HI };
+            let maybe = self.code_loads.values().any(|k| *k == crate::gpu::recomp::code_loads::CodeLoad::Maybe);
+            let code_hi = if !maybe { 0 } else { crate::gpu::recomp::CODE_ADDRESS_HI };
             let hi = self.c(code_hi);
             self.write64(&dst, lo, hi);
             return Ok(());
