@@ -34,9 +34,6 @@ pub(crate) fn log_counts() {
         let r = RECORDINGS.lock().unwrap();
         let keys: Vec<(usize, usize)> = r.iter().map(|(&a, v)| (a, v.len())).collect();
         let held = keys.iter().map(|&(_, n)| n).sum::<usize>();
-        // scout: the chained ExecuteIndirects' command buffers the held recordings keep (system memory, 64 KiB at least)
-        let bytes: u64 = r.values().flatten().filter_map(|x| x.indirect.as_ref()).map(|i| unsafe { i.commands.GetDesc() }.Width.next_multiple_of(64 << 10)).sum();
-        crate::xlog_info!("scout: chained ExecuteIndirect command buffers held: {} MiB", bytes >> 20);
         (keys, held)
     };
     let [users, gpu, free, busy, idle, unknown] = super::super::alloc_pool::holds(&keys);
