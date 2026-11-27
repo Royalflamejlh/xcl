@@ -61,6 +61,10 @@ vkd3d-proton's dxil-spirv (`b540c8a2`) and its output passes `spirv-val`: 1,613 
 ray-tracing programs `XCL_RT_GATE` holds back left out), 2,682 of 2,682 with `XCL_RT_GATE=0`, and 1,613 of 1,613 unsplit;
 the same through `788f3e22` (vkd3d-proton `256f7510`). 1 pass each.
 
+The launch pass under Wine, on the CPU (8 DXC threads, an empty cache each pass, 3 passes each in turn, beside other
+jobs on the machine): the first 182 pixel shaders of the pack took 110, 116 and 127 s on `amd-dev` `7c795f5e` + #684 + #794,
+and 22, 26 and 27 s on this branch, which has #688 and #2872.
+
 ## Running it
 
 As `linux/stack` (its `linux/README.md`): `VKD3D_CONFIG=ignore_shared_fence` and the same `XCL_` switches. Since
