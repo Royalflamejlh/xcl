@@ -22,7 +22,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
         boot.config.log_to_stderr,
     );
     crate::log::log_panics();
-    crate::xlog_info!("XCL {} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
+    let commit = Some(env!("XCL_COMMIT")).filter(|c| !c.is_empty()).map(|c| format!(" ({c})")).unwrap_or_default();
+    crate::xlog_info!("XCL {}{commit} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
     crate::xlog_info!("game: {} (read-only folder: {})", boot.exe_path.display(), boot.game_root.display());
     crate::xlog_info!("XCL data: {}", boot.data_dir.display());
     crate::xlog_info!(

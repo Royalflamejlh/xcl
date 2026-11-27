@@ -43,6 +43,9 @@ pub struct VfsInfo {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Report {
     pub xcl_version: String,
+    /// the commit XCL was built from (`-dirty` with uncommitted changes; empty outside git)
+    #[serde(default)]
+    pub xcl_commit: String,
     pub title: String,
     pub exe: String,
     pub crash: Option<String>,
@@ -130,6 +133,7 @@ pub fn build() -> Report {
         .unwrap_or_default();
     Report {
         xcl_version: env!("CARGO_PKG_VERSION").to_string(),
+        xcl_commit: env!("XCL_COMMIT").to_string(),
         title: boot.map(|b| b.title.clone()).unwrap_or_default(),
         exe: boot.map(|b| b.exe_path.to_string_lossy().into_owned()).unwrap_or_default(),
         crash: CRASH.lock().ok().and_then(|g| g.clone()),
