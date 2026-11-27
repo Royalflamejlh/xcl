@@ -1,8 +1,9 @@
 # XCL on Linux: the stack
 
-The branch that gets XCL furthest on Linux (Wine + vkd3d-proton) as of the date below: `main` plus the open
-pull requests that Linux needs, and the vkd3d-proton patches it still runs with. It moves as pull requests
-merge or new ones help. Measured on NVIDIA (RTX 4060 Ti 16 GB, driver 615.71.09); AMD / RADV not tested.
+The branch that gets XCL furthest on Linux (Wine + vkd3d-proton): `main` plus the open pull requests Linux needs.
+The aim is to run on a stock vkd3d-proton build, with its own dxil-spirv: every fix goes in XCL, nothing in the
+layers. It moves as pull requests merge or new ones help. Measured on NVIDIA (RTX 4060 Ti 16 GB, driver
+615.71.09); AMD / RADV not tested.
 
 Updated 2026-11-27.
 
@@ -31,13 +32,14 @@ Merge conflicts were resolved by keeping both sides; see each merge commit.
 
 ## vkd3d-proton
 
-`v3.1-90-g30b0eb9b`, built with:
+Not there yet: the results below were measured on vkd3d-proton `v3.1-90-g30b0eb9b` with three local patches.
+Each one is being replaced by a change in XCL:
 
-- `vkd3d-proton-xcl-relaxed.patch` (here): accepts XCL's replaced vtables (#175). #2477 (with #867) is the
-  XCL-side fix that removes the need for it on assert-checked builds.
-- `vkd3d-proton-pool-reset-release.patch` (here): command pools release their memory at
-  `ID3D12CommandAllocator::Reset`. Without it the title ran out of RAM at about 2 minutes (#2404, 7189698499).
-- a local dxil-spirv patch (not here).
+| Patch | What it covers | Replaced by |
+|---|---|---|
+| relaxed vtable checks | vkd3d-proton refuses objects whose vtable XCL replaced (#175) | #867 + #2477, to be merged here |
+| command pools release at `Reset` | without it the title ran out of RAM at about 2 minutes (#2404) | an XCL change, not written yet |
+| a local dxil-spirv patch | programs dxil-spirv crashed on | #1860 + #2082 may cover it; not yet checked |
 
 ## Running it
 
