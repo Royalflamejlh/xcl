@@ -639,6 +639,10 @@ fn drop_unstarted_job(p: &Pending) {
     }
 }
 
+/// The stack of the threads that build pipelines: translation recurses deeply on big programs,
+/// and the driver compiles on the calling thread (`xcl shaders` builds on the same)
+pub const WORKER_STACK: usize = 64 << 20;
+
 type Work = Box<dyn FnOnce() + Send>;
 
 fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
@@ -650,7 +654,7 @@ fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
         let n = crate::gpu::recomp::dxc::compile_threads();
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(WORKER_STACK).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(work) = next else { return };
                 while let Some(p) = next_needed() {
@@ -1158,7 +1162,7 @@ fn preload() -> Option<&'static Preload> {
 fn spawn_preload_worker(q: &'static Preload) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let k = NEXT.fetch_add(1, Ordering::Relaxed);
-    let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
+    let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(WORKER_STACK).spawn(move || {
         unsafe {
             use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
