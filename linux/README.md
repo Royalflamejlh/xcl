@@ -19,15 +19,15 @@ so its merge brings `main` up to `f9a0cb80`.
 | #1599 | `5b1518fc` | DirectStorage requests failing at the world load |
 | #1860 | `bb2165b9` | dxil-spirv crashing on XCL's direct DXIL |
 | #2082 | `cab89ed5` | dxil-spirv writing SPIR-V `spirv-val` rejects |
-| #2404 | `5b9d4ff6` | split chained ExecuteIndirect |
-| #2633 | `db34184f` | Dispatch-only signatures for those chains |
-| #2707 | `dff6edc7` | releases recordings in place of #2404's `free_aside` sweep (no device loss) |
+| #2404 | `5b9d4ff6` | split chained ExecuteIndirect (its newer head fixes the sweep #2707 replaces here) |
+| #2633 | `19be6590` | Dispatch-only signatures for those chains |
+| #2707 | `1a3b6981` | releases recordings in place of #2404's `free_aside` sweep (no device loss) |
 | #1803 | `cb007514` | heap addresses the world's shaders read |
-| #2229 | `d2dee320` | the constant data that left the world flat grey |
+| #2229 | `98a629a3` | the constant data that left the world flat grey |
 | #1975 | `72960386` | (with the two above) the world in place of grey |
 | #2753 | `e07d03bf` | 3-D LUT pages: no white overexposure |
 | #2551 | `3567b2ef` | XCL's pipeline blob cache |
-| #2070 | `8cb43460` | 64 MB stacks for offline pipeline builds (a dxil-spirv stack overflow) |
+| #2070 | `d6bd4170` | 64 MB stacks for offline pipeline builds (a dxil-spirv stack overflow) |
 | #1368 | `92ef1316` | pipelines built with `NodeMask` 0, so vkd3d-proton takes the offline pass's blobs (#2453) |
 | #867 | `021b2c33` | keeps vkd3d-proton's native vtables and wraps the title's fences (#175) |
 | #2477 | `5225ddcb` | patches the assert-checked vtables in place under Wine (#175) |
@@ -56,6 +56,10 @@ Warm the driver's shader cache first (an offline `xcl shaders --precompile --onl
 cold cache the title spends minutes with no picture while the driver builds pipelines.
 
 ## How far it gets
+
+On vkd3d-proton `v3.1-90-g30b0eb9b` with the local patches (`8df733bd`, 1 run, caches seeded from an offline pass): the world
+load at 68.0 s, black from 532 s (#505's draw), the movement hint over it at 603–651 s, presents to 851 s; then a
+compute pipeline build started at 843 s had not finished at 901 s.
 
 On stock vkd3d-proton `master` (1 run, `XCL_PREPARE=0 XCL_SKIP_BINK=1`): the world load at 57.5 s and presents to
 90 s, when the run was stopped at 30 GB of RSS: the command-pool memory above, still to be fixed in XCL.
