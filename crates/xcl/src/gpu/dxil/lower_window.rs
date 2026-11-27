@@ -151,17 +151,22 @@ impl Lw {
         self.wr(VAR_WIN, w);
     }
 
-    /// `Lw::rodata` (the HLSL kernel's `xcl_gload`): the dwords `vals` a load read from memory
-    /// at `a`, `a + 4`.. (`a` dword-aligned), with those at a code address inside one of the
-    /// program's constant data blocks replaced by the block's dword. A code address has the
-    /// high dword `CODE_ADDRESS_HI` with several windows (`s_getpc_b64`; the window of the
-    /// access was just selected: `VAR_WIN`) and is the program's offset with one. `vals` as
-    /// they are without data.
-    pub(crate) fn rodata_loads(&mut self, a: Value, vals: Vec<Value>) -> Vec<Value> {
+    /// `Lw::rodata` (the HLSL kernel's `xcl_cload` / `xcl_gload`): the dwords `vals` the load
+    /// at `pc` read from memory at `a`, `a + 4`.. (`a` dword-aligned), with those at a code
+    /// address inside one of the program's constant data blocks replaced by the block's dword
+    /// (`Lw::code_loads`). A load whose address comes from `s_getpc_b64` on every path takes
+    /// the block's dwords (0 outside the blocks); one whose address may come from it tells a
+    /// code address by the high dword `CODE_ADDRESS_HI`: with several windows by the window of
+    /// the access, just selected (`VAR_WIN`), with one by `hi`, the raw high dword of the
+    /// address (the memory at the same low dword is read otherwise). `vals` as they are for the
+    /// other loads and without data.
+    pub(crate) fn rodata_loads(&mut self, pc: u64, hi: Value, a: Value, vals: Vec<Value>) -> Vec<Value> {
         let total: usize = self.rodata.iter().map(|b| b.1.len()).sum();
+        let Some(&kind) = self.code_loads.get(&pc) else { return vals };
         if total == 0 {
             return vals;
         }
+        let only_code = kind == crate::gpu::recomp::code_loads::CodeLoad::Code;
         let table = match self.rodata_table {
             Some(g) => g,
             None => {
@@ -175,14 +180,16 @@ impl Lw {
                 g
             }
         };
-        let code = if self.windowed() {
+        let code = if only_code {
+            None
+        } else if self.windowed() {
             let w = self.rd(VAR_WIN);
             let base = self.uma_base();
             let hi = self.c(crate::gpu::recomp::CODE_ADDRESS_HI);
             let cw = self.sub(hi, base);
             Some(self.cmp(Pred::Eq, w, cw))
         } else {
-            None
+            Some(self.cmpc(Pred::Eq, hi, crate::gpu::recomp::CODE_ADDRESS_HI))
         };
         // per block: `a`'s offset in it, its dword's index in the table, the block's bytes
         let mut first = 0u32;
@@ -216,7 +223,7 @@ impl Lw {
                 }
                 let p = self.s.m.gep(table, &[z, idx]);
                 let t = self.s.m.load(p, 4);
-                self.sel(inside, t, v)
+                self.sel(inside, t, if only_code { z } else { v })
             })
             .collect()
     }
@@ -227,6 +234,20 @@ impl Lw {
         if self.windowed() {
             let hi = self.andc(d1, 0xFFFF);
             self.window_at(hi, d0, adds, write);
+        }
+    }
+
+    /// The raw high dword of a FLAT / global access's address (`flat_window`, `addtid_window`):
+    /// SADDR's, the VGPR pair's or 0.
+    pub fn flat_hi(&mut self, d: &Decoded, addtid: bool) -> Value {
+        let global = d.enc.name == "ENC_FLAT_GLBL";
+        let saddr = Self::fv(d, "SADDR");
+        if (addtid || global) && saddr != 0x7D && saddr != 0x7F {
+            self.sreg(saddr + 1)
+        } else if addtid {
+            self.c(0)
+        } else {
+            self.vreg(Self::fv(d, "ADDR") + 1)
         }
     }
 
