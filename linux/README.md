@@ -1,21 +1,20 @@
 # XCL on Linux: the stack on `amd-dev`
 
 `amd-dev` plus the open pull requests Linux needs, as `linux/stack` carries them on `main`. **AMD is not tested here:**
-the branch is built and run on NVIDIA only (RTX 4060 Ti 16 GB, driver 615.71.09, Wine + vkd3d-proton); nobody has run it
-on an AMD card or on RADV.
+it is built and tested on the CPU and on NVIDIA cards only; nobody has run it on an AMD card or on RADV.
 
 Updated 2026-11-27. Not run on the title yet. It builds, and its lib suite was run under Wine on the CPU (lavapipe, one
 test at a time, 1 run each) on vkd3d-proton `master` `71cae091`, unpatched: 1,713 passed, 22 failed, 28 ignored. 21 of
-the 22 fail on `amd-dev` `7c795f5e` itself (with a vkd3d-proton whose vtable checks are relaxed, which it needs); the
+the 22 fail on `amd-dev` `7c795f5e` + #684 + #794 too (on a vkd3d-proton whose vtable checks are relaxed, which it needs); the
 other one, `depth_uav`'s `gpu_d24s8_and_d16s8_enhanced_barrier_twin_sync_passes_equal_depth_test`, calls the runtime's
-`Reset` on an adopted list itself. `amd-dev` alone on that unpatched vkd3d-proton failed 51 tests and then stopped in a
+`Reset` on an adopted list itself. That `amd-dev` tree on the unpatched vkd3d-proton failed 51 tests and then stopped in a
 texture-upload test. The card tests of the ported pull requests ran on native Windows (RTX 2070 SUPER 8 GB, driver
 621.01) at `9c2edf76`: 33 passed and 2 failed, the two `amd-dev` fails by itself there
 (`offline_compute_pipeline_is_reused_by_a_second_process` and its split twin).
 
 ## What it is
 
-`amd-dev` `7c795f5e` with these on top. `amd-dev` does not hold `main` (34 commits behind today), so a pull request made
+`amd-dev` `7c795f5e` with these on top. `amd-dev` does not hold `main` (36 commits behind today), so a pull request made
 on `main` is merged where that brings no other commit along, and cherry-picked (its author kept) where it would.
 
 | Pull request | Head | How it went in |
