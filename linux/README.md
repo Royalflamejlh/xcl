@@ -3,6 +3,13 @@
 `amd-dev` plus the open pull requests Linux needs, as `linux/stack` carries them on `main`. **AMD is not tested here:**
 it is built and tested on the CPU and on NVIDIA cards only; nobody has run it on an AMD card or on RADV.
 
+The nearest thing to an AMD test so far is a compile check with no card: Mesa's RADV 26.2.4 on the CPU, given a device by
+Mesa's AMD drm-shim (`AMDGPU_GPU_ID=gfx1201`, "AMD Radeon RX 9070 XT (RADV GFX1201)"; submits do nothing, the shader
+compiler is the real one), under Wine with vkd3d-proton `master` `71cae091`, unpatched. XCL's offline pass
+(`xcl shaders <package> --precompile --only cs --pipelines`) at `c2dd387e`, 1 run each: 1,960 compute pipelines made
+and 0 refused in 62 s as a run gets them, and 9,285 made, 0 refused in 772 s with `XCL_RT_GATE=0` (the longest single
+compile 55 s). That says RADV takes every pipeline and none of its compiles hangs there; it does not say they run right.
+
 Updated 2026-11-27. Not run on the title yet. It builds, and its lib suite was run under Wine on the CPU (lavapipe, one
 test at a time, 1 run each) on vkd3d-proton `master` `71cae091`, unpatched: 1,713 passed, 22 failed, 28 ignored. 21 of
 the 22 fail on `amd-dev` `7c795f5e` + #684 + #794 too (on a vkd3d-proton whose vtable checks are relaxed, which it needs); the
