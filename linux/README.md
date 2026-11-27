@@ -7,7 +7,9 @@ on an AMD card or on RADV.
 Updated 2026-11-27. Not run on the title yet: it builds (lib and tests); under Wine on the CPU the ported pull requests'
 lib tests pass (62 of 62, and 49 of 49 of #867's, #2477's and the fence and sparse tests); `gpu::recomp` and `gpu::dxil`
 658 passed and 3 failed, the three `amd-dev` fails by itself (`dispatch_chain_native_wave64_builds_whole`,
-`directed_reference_basics`, `a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier`).
+`directed_reference_basics`, `a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier`). The allocator pool,
+`bind` and `list_x` tests: 111 passed and 2 failed, the two `amd-dev` fails by itself there
+(`bitset_runs_emit_exact_contiguous_page_ranges`, `a_dispatch_with_a_pipeline_still_building_waits_at_the_submit`).
 
 ## What it is
 
@@ -46,11 +48,9 @@ Left out, because `amd-dev` has the fix in a form of its own:
 | #2762 | `c093211e` "a placed view's padding does not make a second texture" |
 | #2404 | its own chained ExecuteIndirect: `77453544`, `fb81714d`, `6a0bb5b4` and later (`real/dispatch_chain.rs`) |
 
-Not ported yet (each conflicts with `amd-dev`'s own code and needs a port, not a merge):
-
-| Pull request | Why it is wanted | State |
-|---|---|---|
-| #2633 | split programs' pieces read their slab from a root CBV | 33 hunks against `amd-dev`'s own chain code |
+Not ported: #2633 (split programs' pieces read their slab from a root CBV, less GPU time for each chained
+ExecuteIndirect). It is written on #2404's chain code, which `amd-dev` replaces with its own (33 conflicts), so it would
+be a rewrite there and needs a card to check.
 
 With #867 + #2477 in, it is meant for stock vkd3d-proton as `linux/stack` is (`master` `71cae091`); not run yet.
 
