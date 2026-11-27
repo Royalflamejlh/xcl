@@ -24,6 +24,11 @@ commits `nvidia-dev` lacks.
 | #2762 | `496ef578` | merged (one `host.rs` conflict, both sides kept) |
 | #867 | `021b2c33` | ported (its commit; conflicts in `real.rs`, `list_x.rs`, `vram.rs`, `sparse.rs`, see the commit) |
 | #2477 | `5225ddcb` | ported (its commit; three `real.rs` conflicts, see the commit) |
+| #1860 | `bb2165b9` | ported (`port/1860-nvidia-dev` `b20a2395`) |
+| #2229 | `98a629a3` | ported (`port/2229-nvidia-dev` `04fddf0a`); replaces `nvidia-dev`'s earlier copy (`41f1a85a`) with the head |
+| #1975 | `72960386` | ported (`port/1975-nvidia-dev` `35852a5d`); its mesh barrier guard left out: `nvidia-dev` sends every multi-wave barrier to HLSL (`fb55e49e`) |
+| #2070 | `d6bd4170` | ported (`port/2070-nvidia-dev` `3ae16650`) |
+| #751 | `59f8e7c9` | ported by hand (`port/751-nvidia-dev` `eebbbf9f`): `nvidia-dev` already copied as #751 does (`copy_readable`) but still read title memory in place; `with_title_bytes` kept, `title_bytes` and `XCL_TEXTURE_SAFE_READ` removed |
 | #1803 | `cb007514` | already in `nvidia-dev` |
 
 Left out, with the reason:
@@ -33,7 +38,7 @@ Left out, with the reason:
 | #2404, #2633 | `nvidia-dev` has its own form: an indirect dispatch of a split program waits for the whole form, built off the call path (#2893); it has no chained ExecuteIndirect |
 | #2707 | it reworks `alloc_pool::title_reset` around #2404's chain recordings; `nvidia-dev` has its own `title_reset` (it returns unified memory per PC allocator, #1358) |
 
-Still to come: #751 and #2864 (being ported), #1860, #2229, #1975, #2070 (shader-side ports).
+Still to come: #2864 (being ported).
 
 ## vkd3d-proton
 
