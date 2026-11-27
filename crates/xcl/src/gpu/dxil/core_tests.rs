@@ -491,6 +491,19 @@ fn multi_window_mem_format_and_bvh_validate() {
 /// window 0 holds other bytes at the table's offset. Any other address still reads the memory.
 #[test]
 fn gpu_direct_loads_read_the_constant_data_after_the_program() {
+    direct_loads_read_the_constant_data(false);
+}
+
+/// As `gpu_direct_loads_read_the_constant_data_after_the_program`, with the memory a load
+/// through the same register pair reads at the table's low offset: with one window only the
+/// high dword of a code address tells them apart (thehollowedone on #2229).
+#[test]
+fn gpu_direct_loads_read_the_constant_data_after_the_program_not_the_memory_at_its_offset() {
+    direct_loads_read_the_constant_data(true);
+}
+
+/// `at_the_table`: the memory s[2:3] points to has the table's low offset (one window only).
+fn direct_loads_read_the_constant_data(at_the_table: bool) {
     use super::kernel::{translate_entry_rodata, Entry};
     use crate::gpu::recomp::{runner, HEAP_WINDOWS};
     let body = |table: u32| {
@@ -555,18 +568,22 @@ fn gpu_direct_loads_read_the_constant_data_after_the_program() {
     };
     // one window: nothing of the code is in the memory
     let mut st = runner::KernelState::default();
-    st.sgpr[2] = 0x900;
+    st.sgpr[2] = if at_the_table { block + 4 } else { 0x900 };
     st.sgpr[6] = 64;
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         r[10] = 4 * (l as u32 % 6);
         r[12] = 0x800 + 4 * l as u32;
     }
     let mut mem = vec![0u32; 1024];
-    mem[0x240..0x243].copy_from_slice(&[4242, 4343, 4444]);
+    let m = (st.sgpr[2] / 4) as usize;
+    mem[m..m + 3].copy_from_slice(&[4242, 4343, 4444]);
     for l in 0..64 {
         mem[0x200 + l] = 7000 + l as u32;
     }
     check(&runner::run(&one, &st, &mem).unwrap(), [table[1], table[2]], "one window");
+    if at_the_table {
+        return;
+    }
     // several windows: a code address is in none of them, and window 0 holds other bytes at
     // the table's offset
     let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();

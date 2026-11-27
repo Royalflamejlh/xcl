@@ -4516,6 +4516,19 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 /// there and wrote one colour to every texel); any other address still reads the memory.
 #[test]
 fn gpu_loads_read_the_constant_data_after_the_program() {
+    loads_read_the_constant_data(false);
+}
+
+/// As `gpu_loads_read_the_constant_data_after_the_program`, with the memory a load through the
+/// same register pair reads at the table's low offset: with one window only the high dword of a
+/// code address tells them apart (thehollowedone on #2229).
+#[test]
+fn gpu_loads_read_the_constant_data_after_the_program_not_the_memory_at_its_offset() {
+    loads_read_the_constant_data(true);
+}
+
+/// `at_the_table`: the memory s[2:3] points to has the table's low offset (one window only).
+fn loads_read_the_constant_data(at_the_table: bool) {
     let body = |table: u32| {
         prog(&[
             ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None), // s[0:1] = 4
@@ -4564,13 +4577,14 @@ fn gpu_loads_read_the_constant_data_after_the_program() {
     };
     // one window: nothing of the code is in the memory
     let mut st = KernelState::default();
-    st.sgpr[2] = 0x900;
+    st.sgpr[2] = if at_the_table { block + 4 } else { 0x900 };
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         r[10] = 4 * (l as u32 % 6);
         r[12] = 0x800 + 4 * l as u32;
     }
     let mut mem = vec![0u32; 1024];
-    mem[0x240..0x242].copy_from_slice(&[4242, 4343]);
+    let m = (st.sgpr[2] / 4) as usize;
+    mem[m..m + 2].copy_from_slice(&[4242, 4343]);
     for l in 0..64 {
         mem[0x200 + l] = 7000 + l as u32;
     }
@@ -4578,6 +4592,9 @@ fn gpu_loads_read_the_constant_data_after_the_program() {
     assert!(t.complete(), "{:?}", t.unsupported);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     check(&runner::run(&dxil, &st, &mem).unwrap(), "one window");
+    if at_the_table {
+        return;
+    }
     // several windows: a code address is in none of them, and window 0 holds other bytes at
     // the table's offset
     let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();

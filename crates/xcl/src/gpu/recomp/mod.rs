@@ -206,10 +206,11 @@ pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
 /// High dword `s_getpc_b64` gives a program that has constant data in its code region
-/// (`Options::rodata`), a load that may or may not read it (`code_loads::CodeLoad::Maybe`) and
-/// several memory windows: its code addresses are then above every
+/// (`Options::rodata`) and a load that may or may not read it (`code_loads::CodeLoad::Maybe`),
+/// with any number of memory windows: its code addresses are then above every
 /// address a title can have (user space ends at 0x7FFF_FFFF_FFFF), so a load from the data is
-/// told from a load of the title's memory at the same low dword (descriptor tables in window 0).
+/// told from a load of the title's memory at the same low dword (descriptor tables in window 0,
+/// any memory with one window, which ignores the high dword).
 pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
 
 impl GsInterface {

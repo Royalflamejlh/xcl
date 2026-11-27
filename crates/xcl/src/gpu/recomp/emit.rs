@@ -1605,12 +1605,12 @@ impl Em {
             return Err("indirect branch");
         }
         if name == "s_getpc_b64" {
-            // the code region is addressed from 0 in this model – with several memory windows
-            // and a load that may or may not read the constant data after the program, above
-            // them all (`rodata_loader`)
+            // the code region is addressed from 0 in this model – with a load that may or may
+            // not read the constant data after the program, above every memory address
+            // (`rodata_loader`)
             let pc = d.pc + d.len as u64;
             let maybe = self.code_loads.values().any(|k| *k == super::code_loads::CodeLoad::Maybe);
-            let hi = if !maybe || self.opt.mem_windows <= 1 { "0u".to_string() } else { hex(super::CODE_ADDRESS_HI) };
+            let hi = if !maybe { "0u".to_string() } else { hex(super::CODE_ADDRESS_HI) };
             self.write64(&dst, &hex(pc as u32), &hi);
             return Ok(());
         }
@@ -1985,7 +1985,7 @@ impl Em {
                 self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
             }
             // (with constant data in the code, which `s_load` reads too: `rodata_loader`)
-            let hi = if self.opt.mem_windows > 1 { format!("(uint)({t}_ea >> 32), ") } else { "0u, ".into() };
+            let hi = if self.opt.mem_windows > 1 { format!("(uint)({t}_ea >> 32), ") } else { format!("{hi}, ") };
             let (load, hi) = self.code_load(d, &hi);
             match count {
                 1 => {
@@ -4462,8 +4462,19 @@ impl Em {
         let t = self.t();
         self.emit_flat_addr(global, op.ends_with("_addtid"), saddr, f("ADDR"), off, 0, store, &t);
         let act = self.act();
-        // (with constant data in the code: `rodata_loader`)
-        let hi = if self.opt.mem_windows > 1 { format!("(uint)({t}_ea >> 32), ") } else { "0u, ".into() };
+        // (with constant data in the code: `rodata_loader`; with one window the address is the
+        // low dword, and the high dword only tells a code address)
+        let hi = if self.code_loads.get(&d.pc) != Some(&super::code_loads::CodeLoad::Maybe) {
+            String::new()
+        } else if self.opt.mem_windows > 1 {
+            format!("(uint)({t}_ea >> 32), ")
+        } else if (op.ends_with("_addtid") || global) && saddr != 0x7D && saddr != 0x7F {
+            format!("{}, ", self.sreg(saddr + 1))
+        } else if op.ends_with("_addtid") {
+            "0u, ".into()
+        } else {
+            format!("{}, ", self.vreg(f("ADDR") + 1))
+        };
         let (load, hi) = self.code_load(d, &hi);
         let mut st = Vec::new();
         for i in 0..count {
@@ -4895,7 +4906,7 @@ impl Em {
         } else {
             h.push_str(LOADX4_ONE_WINDOW);
         }
-        h.push_str(&rodata_loader(&self.opt.rodata, windows > 1));
+        h.push_str(&rodata_loader(&self.opt.rodata));
         for (i, (_, cmp)) in self.static_used.iter().enumerate() {
             let k = self.opt.static_sampler_base as usize + i;
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
@@ -6556,12 +6567,13 @@ const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
 /// - `xcl_cload*(a)`: the address comes from `s_getpc_b64` on every path – the dwords at code
 ///   address `a` (0 outside the blocks), no memory access;
 /// - `xcl_gload*(hi, a)`: it may – the memory is read, and a code address inside a block (high
-///   dword `CODE_ADDRESS_HI` with several memory windows, any with one) selects the block's
-///   dwords instead, with no branch (a test of the window index in a branch around the load
-///   made the NVIDIA Linux driver fault while compiling).
+///   dword `CODE_ADDRESS_HI`, also with one memory window, where the title's memory at the same
+///   low dword is read otherwise) selects the block's dwords instead, with no branch (a test of
+///   the window index in a branch around the load made the NVIDIA Linux driver fault while
+///   compiling).
 ///
 /// Nothing without data.
-fn rodata_loader(rodata: &[(u32, Vec<u32>)], windows: bool) -> String {
+fn rodata_loader(rodata: &[(u32, Vec<u32>)]) -> String {
     let total: usize = rodata.iter().map(|b| b.1.len()).sum();
     if total == 0 {
         return String::new();
@@ -6580,8 +6592,7 @@ fn rodata_loader(rodata: &[(u32, Vec<u32>)], windows: bool) -> String {
     s.push_str("uint2 xcl_cload2(uint a) { return uint2(xcl_cload(a), xcl_cload(a + 4u)); }\n");
     s.push_str("uint4 xcl_cload4(uint a) { return uint4(xcl_cload(a), xcl_cload(a + 4u), xcl_cload(a + 8u), xcl_cload(a + 12u)); }\n");
     let inside = inside.into_iter().reduce(|x, y| format!("or({x}, {y})")).expect("a block");
-    let code = if windows { format!("and(hi == {:#X}u, {inside})", super::CODE_ADDRESS_HI) } else { inside };
-    let _ = writeln!(s, "bool xcl_code(uint hi, uint a) {{ return {code}; }}");
+    let _ = writeln!(s, "bool xcl_code(uint hi, uint a) {{ return and(hi == {:#X}u, {inside}); }}", super::CODE_ADDRESS_HI);
     for (n, ty) in [("", "uint"), ("2", "uint2"), ("4", "uint4")] {
         let c = if n.is_empty() { "c".to_string() } else { format!("(bool{n})c") };
         let _ = writeln!(s, "{ty} xcl_gload{n}(uint hi, uint a) {{ {ty} m = mem.Load{n}(a); bool c = xcl_code(hi, a); return select({c}, xcl_cload{n}(a), m); }}");

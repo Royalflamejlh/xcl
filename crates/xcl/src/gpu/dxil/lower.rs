@@ -1312,12 +1312,12 @@ impl Lw {
             return err(d, "indirect branch");
         }
         if name == "s_getpc_b64" {
-            // the code region is addressed from 0 – with several memory windows and a load that
-            // may or may not read the constant data after the program, above them all
-            // (`rodata_loads`), as the HLSL kernel
+            // the code region is addressed from 0 – with a load that may or may not read the
+            // constant data after the program, above every memory address (`rodata_loads`), as
+            // the HLSL kernel
             let pc = d.pc + d.len as u64;
             let maybe = self.code_loads.values().any(|k| *k == crate::gpu::recomp::code_loads::CodeLoad::Maybe);
-            let code_hi = if !maybe || !self.windowed() { 0 } else { crate::gpu::recomp::CODE_ADDRESS_HI };
+            let code_hi = if !maybe { 0 } else { crate::gpu::recomp::CODE_ADDRESS_HI };
             let (lo, hi) = (self.c(pc as u32), self.c(code_hi));
             self.write64(&dst, lo, hi);
             return Ok(());

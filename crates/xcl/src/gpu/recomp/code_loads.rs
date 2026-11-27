@@ -118,19 +118,54 @@ fn address(d: &Decoded) -> Option<(usize, Vec<usize>)> {
     }
 }
 
+/// The registers `d` reads (s0..s127, then v0..v255), and whether one of its sources is a
+/// constant (inline or literal). An SDWA source with S0 / S1 set is an SGPR, which
+/// `rdna2::sgpr_uses` leaves out (SRC0) and `rdna2::vgpr_uses` takes for a VGPR (VSRC1).
+fn reads(d: &Decoded) -> (Vec<usize>, bool) {
+    let (sr, _) = rdna2::sgpr_uses(d);
+    let (vr, _) = rdna2::vgpr_uses(d);
+    let mut regs: Vec<usize> = sr.iter().map(|&r| r as usize).chain(vr.iter().map(|&r| 128 + r as usize)).collect();
+    let mut constant = d.ienc.operands.iter().filter(|o| !o.output && !o.implicit).any(|o| {
+        o.field.is_some_and(|f| {
+            matches!(f, "SRC0" | "SRC1" | "SRC2" | "SSRC0" | "SSRC1")
+                && !(f == "SRC0" && d.variant != rdna2::Variant::Plain)
+                && rdna2::field_value(d.enc, &d.words, f).is_some_and(|v| (128..=255).contains(&v))
+        })
+    });
+    // an SDWA source with S0 / S1 set: an SGPR or a constant (0..=255)
+    let mut scalar = |regs: &mut Vec<usize>, v: u64| match v {
+        0..=127 if v != 125 => regs.push(v as usize),
+        128..=255 => constant = true,
+        _ => {}
+    };
+    if d.variant == rdna2::Variant::Sdwa {
+        let ext = d.words.get(1).copied().unwrap_or(0) as u64;
+        if ext >> 23 & 1 == 1 {
+            scalar(&mut regs, ext & 0xff);
+        }
+        if let Some(v) = rdna2::field_value(d.enc, &d.words, "VSRC1").filter(|_| ext >> 31 & 1 == 1) {
+            regs.retain(|&r| r != 128 + v as usize);
+            scalar(&mut regs, v);
+        }
+    }
+    regs.retain(|&r| r < REGS);
+    (regs, constant)
+}
+
 /// The kinds after `d`: `s_getpc_b64` gives code addresses, a load gives data, a select joins
-/// what it selects from, and any other instruction gives a code address when it computes with
-/// one (an offset added to it).
+/// what it selects from (a constant: data), and any other instruction gives a code address when
+/// it computes with one (an offset added to it).
 fn step(st: &mut [K], d: &Decoded) {
-    let (sr, sw) = rdna2::sgpr_uses(d);
-    let (vr, vw) = rdna2::vgpr_uses(d);
-    let reads = sr.iter().map(|&r| r as usize).chain(vr.iter().map(|&r| 128 + r as usize)).filter(|&r| r < REGS);
+    let (_, sw) = rdna2::sgpr_uses(d);
+    let (_, vw) = rdna2::vgpr_uses(d);
+    let (regs, constant) = reads(d);
+    let reads = regs.into_iter();
     let k = if d.inst.name == "S_GETPC_B64" {
         K::Code
     } else if matches!(d.enc.name, "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_DS" | "ENC_MIMG") {
         K::Data
     } else if matches!(d.inst.name, "V_CNDMASK_B32" | "S_CSELECT_B32" | "S_CSELECT_B64") {
-        reads.map(|r| st[r]).reduce(join).unwrap_or(K::Data)
+        reads.map(|r| st[r]).chain(constant.then_some(K::Data)).reduce(join).unwrap_or(K::Data)
     } else {
         let mut k = K::Data;
         for r in reads {
@@ -189,5 +224,30 @@ mod tests {
         ]);
         let m = code_loads(&p);
         assert_eq!(m, BTreeMap::from([(p[5].pc, CodeLoad::Code), (p[7].pc, CodeLoad::Code), (p[11].pc, CodeLoad::Maybe)]));
+    }
+
+    /// A select between a code address and a constant gives either (the load is decided at run
+    /// time); an SDWA form that takes the code address from an SGPR (S0 / S1) computes with it.
+    #[test]
+    fn constant_and_sdwa_sources_count() {
+        let sdwa: &[(&str, u64)] = &[("SRC0", 0xF9), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6)];
+        let p = insts(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None),
+            // s[2:3]: the code address, or 0 for its high dword
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 0)], None),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 1), ("SSRC1", 128)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)], None),
+            // v[10:11]: the code address, its high dword moved from s1 by SRC0 (S0)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 0)], None),
+            ("V_MOV_B32", "VOP1_VOP_SDWA", &[sdwa, &[("VDST", 11), ("VSRC0", 1), ("S0", 1)]].concat(), None),
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 10), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+            // v13: v12 plus s1 as VSRC1 (S1)
+            ("V_ADD_NC_U32", "VOP2_VOP_SDWA", &[sdwa, &[("VDST", 13), ("VSRC0", 12), ("VSRC1", 1), ("S1", 1)]].concat(), None),
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 21), ("ADDR", 12), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]);
+        assert_eq!(p[5].variant, rdna2::Variant::Sdwa);
+        let m = code_loads(&p);
+        assert_eq!(m, BTreeMap::from([(p[3].pc, CodeLoad::Maybe), (p[6].pc, CodeLoad::Code), (p[8].pc, CodeLoad::Code)]));
     }
 }
