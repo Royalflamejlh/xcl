@@ -27,6 +27,7 @@ on `main` is merged where that brings no other commit along, and cherry-picked (
 | #2753 | `e07d03bf` | cherry-picked; `place()` on `amd-dev` keeps the XG texture it laid out, so the size comes from that one, with the same fall-back for a 3-D target |
 | #867 | `021b2c33` | cherry-picked; `amd-dev`'s class tables are RwLocks, its own code stays around each guarded PC call, and the fences it added since (sparse's `rb_done_fence` and per-queue fences, vram's retire queue, `console_heap`'s queue fences) are raw ones too |
 | #2477 | `5225ddcb` | cherry-picked on #867; `make_class` keeps `amd-dev`'s `find_matching_class`, and a class patched in place has no copied snapshot |
+| #2707 | `1a3b6981` | in part: of its six commits, `78799549` is in `amd-dev` already and `f796b9e6` is there as `5568d655` (`backing_allocator`); `068671d5` (the reset guard) and `dff6edc7` are cherry-picked, clean; `59cc732a` and `1a3b6981` are left out: `amd-dev` holds a released allocator's busy backings its own way (`pending_releases`), and the last builds on the other's orphan list |
 
 Already in `amd-dev`: #1803 (its head `cb007514` is an ancestor).
 
@@ -43,7 +44,6 @@ Not ported yet (each conflicts with `amd-dev`'s own code and needs a port, not a
 
 | Pull request | Why it is wanted | State |
 |---|---|---|
-| #2707 | the allocator pool's reset races (no device loss on `linux/stack`) | its first commit is in `amd-dev` (`78799549`); the other five conflict in `alloc_pool.rs`, `bind.rs`, `real.rs` |
 | #2633 | split programs' pieces read their slab from a root CBV | 33 hunks against `amd-dev`'s own chain code |
 | #2229, #1975, #2070 | the shader-side fixes | ported separately |
 
