@@ -9,7 +9,8 @@ Updated 2026-11-27.
 
 ## What it is
 
-`main` `b49be18` (before #2555's launch pass) with these pull requests merged, in this order, at these heads:
+`main` `b49be18` with these pull requests merged, in this order, at these heads. #2477 (with #867) sits on `main` `f9a0cb80`,
+so its merge brings `main` up to `f9a0cb80`.
 
 | Pull request | Head | What it does on Linux |
 |---|---|---|
@@ -27,6 +28,8 @@ Updated 2026-11-27.
 | #2753 | `e07d03bf` | 3-D LUT pages: no white overexposure |
 | #2551 | `3567b2ef` | XCL's pipeline blob cache |
 | #2070 | `8cb43460` | 64 MB stacks for offline pipeline builds (a dxil-spirv stack overflow) |
+| #867 | `021b2c33` | keeps vkd3d-proton's native vtables and wraps the title's fences (#175) |
+| #2477 | `5225ddcb` | patches the assert-checked vtables in place under Wine (#175) |
 
 Merge conflicts were resolved by keeping both sides; see each merge commit.
 
@@ -37,20 +40,23 @@ Each one is being replaced by a change in XCL:
 
 | Patch | What it covers | Replaced by |
 |---|---|---|
-| relaxed vtable checks | vkd3d-proton refuses objects whose vtable XCL replaced (#175) | #867 + #2477, to be merged here |
+| relaxed vtable checks | vkd3d-proton refuses objects whose vtable XCL replaced (#175) | #867 + #2477, merged here; not yet run on stock vkd3d-proton |
 | command pools release at `Reset` | without it the title ran out of RAM at about 2 minutes (#2404) | an XCL change, not written yet |
 | a local dxil-spirv patch | programs dxil-spirv crashed on | #1860 + #2082 may cover it; not yet checked |
 
 ## Running it
 
 `VKD3D_CONFIG=ignore_shared_fence` (the title's shared fences never complete under Wine) and
-`XCL_DIRECT_DXIL=1 XCL_HUGE_PSO_WANTED_CONCURRENCY=6 XCL_DXC_THREADS=4 XCL_PSO_DISK_CACHE=1`.
+`XCL_DIRECT_DXIL=1 XCL_HUGE_PSO_WANTED_CONCURRENCY=6 XCL_DXC_THREADS=4 XCL_PSO_DISK_CACHE=1`. `XCL_PREPARE=0` leaves out
+the launch pass `main` runs by default since #2555; the runs below had none.
 Warm the driver's shader cache first (an offline `xcl shaders --precompile --only cs --pipelines` pass): on a
 cold cache the title spends minutes with no picture while the driver builds pipelines.
 
 ## How far it gets
 
-On the RTX 4060 Ti: the world load at about 53 s, the intro to about 520 s (colour banding), the movement
-hint at about 590 s. Frames after it were black, and 2 of 3 runs of 900 s stopped late (685 and 793 s); one
-ran to the end. The black is the tile-grid draw traced on #505. It peaks around 34 GB of system RAM. On an
-RTX 4070 12 GB the same tree stopped drawing at the world load. Reports: #175, #505, #2404, #2899.
+Measured before #867 and #2477 came in, with the vkd3d-proton patches. On the RTX 4060 Ti: the world load at about
+53 s, the intro to about 520 s (colour banding), then black frames from about 529 s, with the movement hint at about
+590 s drawn over them. 2 of 3 runs of 900 s stopped late (685 and 793 s) on a compute pipeline build that never
+finished; one ran to the end. The black is the tile-grid draw traced on #505: with that draw's writes turned off the
+scene showed (#505, 7223345779). It peaks around 34 GB of system RAM. On an RTX 4070 12 GB the same tree stopped
+drawing at the world load. Reports: #175, #505, #2404, #2899.
