@@ -53,6 +53,8 @@ struct PipelineBuilder {
     device: ID3D12Device,
     create: PsoFn,
     signature: ID3D12RootSignature,
+    /// its `pso::abi_signature_id`, which names the pieces' driver blobs (`driver_cache`)
+    chain: u64,
     flags: D3D12_PIPELINE_STATE_FLAGS,
     node: u32,
     record: u64,
@@ -63,7 +65,7 @@ impl PipelineBuilder {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
         let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
-            dxil, self.record, iid, &mut raw, ComputeBuild::Chain);
+            dxil, self.record, iid, &mut raw, ComputeBuild::Chain(self.chain));
         (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
     }
 }
@@ -176,7 +178,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
     let rs = signature.as_raw() as usize;
     let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature,
-        flags: desc.Flags, node: desc.NodeMask, record });
+        chain: pso::abi_signature_id(true, samplers), flags: desc.Flags, node: desc.NodeMask, record });
     let jobs = (0..plan.pieces.len()).map(|i| {
         let plan = plan.clone();
         let builder = builder.clone();
@@ -705,7 +707,7 @@ mod tests {
             let rs = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
             let first: ID3D12PipelineState = dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: std::mem::transmute_copy(&rs),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() }, ..Default::default() }).unwrap();
-            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), chain: 0, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
             let pso = first.as_raw() as usize;
             CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
                 build_whole: Mutex::new(()), waiting: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
@@ -794,7 +796,7 @@ mod tests {
             }
             let dev = dev.unwrap();
             let rs = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
-            let builder = Arc::new(PipelineBuilder { device: dev, create: refused, signature: rs, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let builder = Arc::new(PipelineBuilder { device: dev, create: refused, signature: rs, chain: 0, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
             // a huge whole form no cache has: its build on `want_whole`'s thread is gated
             let mut code = vec![0u8; huge_pso_bytes()];
             let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();

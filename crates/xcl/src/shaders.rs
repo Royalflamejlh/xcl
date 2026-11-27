@@ -1486,10 +1486,11 @@ mod pipeline_cap_tests {
         // a cap that lets every piece and the whole form through
         pipelines.max_dxil = max_piece.max(whole.len());
         pipelines.make(&compiled);
-        let p0_path = scratch.0.join(driver_cache::name_for(&piece0, 0, true));
-        let p1_path = scratch.0.join(driver_cache::name_for(&piece1, 0, true));
-        let whole_path = scratch.0.join(driver_cache::name_for(&whole, 0, false));
-        let whole_chain_path = scratch.0.join(driver_cache::name_for(&whole, 0, true));
+        let chain = Some(recomp::pso::abi_signature_id(true, &[]));
+        let p0_path = scratch.0.join(driver_cache::name_for(&piece0, 0, chain));
+        let p1_path = scratch.0.join(driver_cache::name_for(&piece1, 0, chain));
+        let whole_path = scratch.0.join(driver_cache::name_for(&whole, 0, None));
+        let whole_chain_path = scratch.0.join(driver_cache::name_for(&whole, 0, chain));
         assert_eq!(pipelines.split_programs.load(Ordering::Relaxed), 1);
         assert_eq!(pipelines.split_pieces.load(Ordering::Relaxed), 2);
         // both pieces and the whole form, all under the dispatch-chain root signature: the runtime
@@ -1651,12 +1652,13 @@ impl Pipelines {
             ..Default::default()
         };
         use crate::hle::d3d12x::real::driver_cache;
+        let chain = chained.then(|| recomp::pso::abi_signature_id(true, samplers));
         let path = path_override.or_else(|| {
             #[cfg(test)]
             if let Some(dir) = self.cache_dir.as_deref() {
-                return Some(dir.join(driver_cache::name_for(dxil, desc.Flags.0, chained)));
+                return Some(dir.join(driver_cache::name_for(dxil, desc.Flags.0, chain)));
             }
-            driver_cache::path_for(dxil, desc.Flags.0, chained)
+            driver_cache::path_for(dxil, desc.Flags.0, chain)
         });
         let cached = path.as_deref().and_then(driver_cache::load);
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;

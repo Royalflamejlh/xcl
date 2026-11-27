@@ -1545,13 +1545,14 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
     unsafe { dev.CreateRootSignature(0, &blob).map_err(|e| format!("CreateRootSignature: {e}")) }
 }
 
-/// A hash of the compute ABI root signature (serialized, no static samplers). The pieces of a
-/// split program keep their driver blob under it (`driver_cache::name_for`): their DXIL stays the
-/// same when the chain's root parameters change, and the driver refuses a blob built for others.
-pub(crate) fn abi_signature_id(split: bool) -> u64 {
+/// A hash of the compute ABI root signature (serialized, with its static samplers). The pieces of
+/// a split program keep their driver blob under it (`driver_cache::name_for`): their DXIL stays the
+/// same when the chain's root parameters or static samplers change, and the driver refuses a blob
+/// built for others.
+pub(crate) fn abi_signature_id(split: bool, samplers: &[StaticSampler]) -> u64 {
     static SPLIT: OnceLock<u64> = OnceLock::new();
-    let id = || abi_signature_blob(false, &[], split).map_or(0, |b| crate::gpu::shader::fnv64(&b));
-    if split { *SPLIT.get_or_init(id) } else { id() }
+    let id = || abi_signature_blob(false, samplers, split).map_or(0, |b| crate::gpu::shader::fnv64(&b));
+    if split && samplers.is_empty() { *SPLIT.get_or_init(id) } else { id() }
 }
 
 fn abi_signature_blob(graphics: bool, samplers: &[StaticSampler], split: bool) -> Result<Vec<u8>, String> {
