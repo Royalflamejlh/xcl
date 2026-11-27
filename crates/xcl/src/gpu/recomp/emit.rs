@@ -7173,13 +7173,16 @@ const PRELUDE_PIXEL: &str = r#"
 // compare's vector operands, not of its result (`quad_bits`: AMD's compiler crashed on those,
 // #134); elsewhere ballot_px quad-reads the result.
 uint2 ballot_px_quad(uint q) {
-    uint2 m = uint2(0u, 0u);
-    [unroll] for (uint p = 0u; p < 4u; p++) {
-        uint2 w = WaveActiveBallot(((q >> p) & 1u) != 0u).xy;
-        w |= w >> 1;
-        w |= w >> 2;
-        m |= (w & 0x11111111u) << p;
-    }
+    uint2 w0 = WaveActiveBallot(((q >> 0u) & 1u) != 0u).xy;
+    w0 |= w0 >> 1; w0 |= w0 >> 2;
+    uint2 w1 = WaveActiveBallot(((q >> 1u) & 1u) != 0u).xy;
+    w1 |= w1 >> 1; w1 |= w1 >> 2;
+    uint2 w2 = WaveActiveBallot(((q >> 2u) & 1u) != 0u).xy;
+    w2 |= w2 >> 1; w2 |= w2 >> 2;
+    uint2 w3 = WaveActiveBallot(((q >> 3u) & 1u) != 0u).xy;
+    w3 |= w3 >> 1; w3 |= w3 >> 2;
+    uint2 m = ((w0 & 0x11111111u) << 0u) | ((w1 & 0x11111111u) << 1u)
+            | ((w2 & 0x11111111u) << 2u) | ((w3 & 0x11111111u) << 3u);
     return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y));
 }
 uint2 ballot_px(bool b) {
@@ -7714,5 +7717,15 @@ mod tests {
                 assert_eq!(p, [want_x, want_y, 1.0, 1.0], "pixel ({x}, {y}) mismatch: {p:?}");
             }
         }
+    }
+
+    #[test]
+    fn quad_ballot_pixel_helper_has_no_loop_for_dxc_to_unroll() {
+        let pixel = super::PRELUDE_PIXEL;
+        let start = pixel.find("uint2 ballot_px_quad(uint q) {").expect("ballot_px_quad in PRELUDE_PIXEL");
+        let rest = &pixel[start..];
+        let quad = &rest[..rest.find("\n}\n").expect("ballot_px_quad closing brace") + 2];
+        let looped = quad.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| ["for", "while", "unroll"].contains(&w));
+        assert!(!looped, "a loop remains in ballot_px_quad():\n{quad}");
     }
 }
