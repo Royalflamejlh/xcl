@@ -427,9 +427,9 @@ impl FrameRate {
 /// While XCL compiles shaders (DXC, programs the disk cache did not have – the title draws
 /// nothing with those pipelines meanwhile: after an XCL update the screen stays black while
 /// thousands recompile), the window's title says so:
-/// "XCL – <game> | N FPS | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
+/// "XCL – <game> | N FPS | compiling shaders: N running, M done[, Q pipelines queued][, F failed][ | <commit>]".
 /// It stays 2 s after the last compile (compiles in the title's own calls come one by one),
-/// then only the game name and presented frame rate remain.
+/// then only the game name, the presented frame rate and the build's commit remain.
 unsafe fn show_compiling(hwnd: HWND) {
     static SHOWN: Mutex<Option<String>> = Mutex::new(None);
     static LAST_ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
@@ -451,19 +451,26 @@ unsafe fn show_compiling(hwnd: HWND) {
         }
         last.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
     };
-    let title = format!("XCL – {} | {fps:.1} FPS", window_name());
-    let text = if recent {
+    let status = recent.then(|| {
         let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
         let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("{title} | compiling shaders: {running} running, {done} done{queued}{failed}")
-    } else {
-        title
-    };
+        format!("compiling shaders: {running} running, {done} done{queued}{failed}")
+    });
+    let text = title_text(&window_name(), fps, status.as_deref());
     let mut shown = SHOWN.lock().unwrap();
     if shown.as_deref() != Some(text.as_str()) {
         let _ = SetWindowTextW(hwnd, &HSTRING::from(text.as_str()));
         *shown = Some(text);
     }
+}
+
+fn title_text(game: &str, fps: f64, status: Option<&str>) -> String {
+    let mut text = format!("XCL – {game} | {fps:.1} FPS");
+    for part in status.into_iter().chain(Some(env!("XCL_COMMIT")).filter(|c| !c.is_empty())) {
+        text.push_str(" | ");
+        text.push_str(part);
+    }
+    text
 }
 
 fn window_thread() {
@@ -1476,6 +1483,18 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_title_ends_with_the_builds_commit() {
+        let commit = env!("XCL_COMMIT");
+        assert!(commit.is_empty() || commit.trim_end_matches("-dirty").len() == 7, "{commit}");
+        let tail = if commit.is_empty() { String::new() } else { format!(" | {commit}") };
+        assert_eq!(title_text("Game", 59.94, None), format!("XCL – Game | 59.9 FPS{tail}"));
+        assert_eq!(
+            title_text("Game", 1.26, Some("compiling shaders: 2 running, 40 done")),
+            format!("XCL – Game | 1.3 FPS | compiling shaders: 2 running, 40 done{tail}")
+        );
+    }
 
     #[test]
     fn present_ring_overlaps_previous_frame_and_drains_cleanly() {

@@ -392,7 +392,7 @@ impl RecompAgg {
         }
     }
 
-    fn add(&mut self, name: &str, code: &[u8], keep: usize, mode: recomp::Mode) {
+    fn add(&mut self, name: &str, code: &[u8], wave64: bool, keep: usize, mode: recomp::Mode) {
         // `XCL_RECOMP_ONLY=<hash>` (the hex prefix of an `XCL_DUMP_HLSL` file): that program alone
         if let Ok(only) = std::env::var("XCL_RECOMP_ONLY") {
             if format!("{:016x}", name_hash(name)) != only {
@@ -414,7 +414,6 @@ impl RecompAgg {
             }
         }
         self.programs += 1;
-        let wave64 = recomp::detect_wave64(code);
         self.wave32 += !wave64 as usize;
         let (label, profile) = match &mode {
             recomp::Mode::Vertex(_) => ("VS", "vs_6_6"),
@@ -673,7 +672,8 @@ impl Agg {
                 let mode = recomp::interface(blob, &sh, f).unwrap_or(recomp::Mode::Kernel);
                 for p in &f.programs {
                     let keep = self.keep;
-                    self.rc.add(&format!("{name} FSSM#{fi}"), &f.data[p.offset..p.offset + p.len], keep, mode.clone());
+                    let code = &f.data[p.offset..p.offset + p.len];
+                    self.rc.add(&format!("{name} FSSM#{fi}"), code, recomp::fssm_wave64(f, code), keep, mode.clone());
                     // `--example name=…`: FSSM header (up to the code) as dwords, once
                     if EXAMPLE_FOR.get().is_some_and(|w| w.starts_with("name=")) && !HEADER_SHOWN.swap(true, Ordering::Relaxed) {
                         let end = f.code.map(|c| c.0).unwrap_or(0x400).min(f.data.len()).min(0x800);
@@ -2548,6 +2548,21 @@ mod tests {
         assert_eq!(order.len(), 3);
         let cov = coverage(&a, &order, &[1, 3]);
         assert_eq!(cov, vec![(1, 0), (3, 2)]);
+    }
+
+    /// The recompiler statistics take a program's wave size as the pipelines do: from the FSSM
+    /// header's wave32 flag where the code has no EXEC write to tell.
+    #[test]
+    fn recompiler_statistics_count_wave32_by_the_header_flag() {
+        let wave32 = |flags: u32| {
+            let mut f = fssm(&CODE, &[(6, 5)]);
+            f[0xD4..0xD8].copy_from_slice(&flags.to_le_bytes());
+            let mut a = Agg { recomp_on: true, ..Default::default() };
+            a.add("CS_a", &sample(5, &[f]));
+            (a.rc.programs, a.rc.wave32)
+        };
+        assert_eq!(wave32(0x20), (1, 1));
+        assert_eq!(wave32(0), (1, 0));
     }
 
     /// Real data check (skipped unless XCL_SAMPLE_RPF points at an RPF9 shader pack).

@@ -95,4 +95,22 @@ fn main() {
         add(&mut d, &[0]);
     }
     println!("cargo:rustc-env=XCL_DIRECT_DXIL_SOURCE_ID={d:016x}");
+    println!("cargo:rustc-env=XCL_COMMIT={}", commit(root));
+}
+
+/// The checkout's commit for the window title, the log and the report: 7 characters, `-dirty` with uncommitted changes, empty outside git.
+fn commit(root: &Path) -> String {
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").args(args).current_dir(root).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let Some(head) = git(&["rev-parse", "HEAD"]).filter(|h| h.len() >= 7) else { return String::new() };
+    if let Some(dir) = git(&["rev-parse", "--absolute-git-dir"]) {
+        for file in ["HEAD", "logs/HEAD"].map(|f| Path::new(&dir).join(f)).iter().filter(|p| p.exists()) {
+            println!("cargo:rerun-if-changed={}", file.display());
+        }
+    }
+    println!("cargo:rerun-if-changed=src");
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
+    format!("{}{}", &head[..7], if dirty { "-dirty" } else { "" })
 }
