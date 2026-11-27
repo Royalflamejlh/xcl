@@ -1,0 +1,29 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 2fa163c4..aaa360ab 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -3352,10 +3352,11 @@ static bool d3d12_command_allocator_allocate_query_from_heap_type(struct d3d12_c
+ 
+ static struct d3d12_command_allocator *d3d12_command_allocator_from_iface(ID3D12CommandAllocator *iface)
+ {
+-    if (!iface || iface->lpVtbl != &d3d12_command_allocator_vtbl)
++    /* XCL diagnostic build (ivall/xcl#175): XCL replaces the vtable pointer, accept any table. */
++    if (!iface)
+         return NULL;
+ 
+-    return impl_from_ID3D12CommandAllocator(iface);
++    return CONTAINING_RECORD(iface, struct d3d12_command_allocator, ID3D12CommandAllocator_iface);
+ }
+ 
+ uint32_t d3d12_command_allocator_allocate_meta_index(
+@@ -23481,8 +23482,8 @@ struct d3d12_command_list *d3d12_command_list_from_iface(ID3D12CommandList *ifac
+             iface->lpVtbl == (struct ID3D12CommandListVtbl *)&d3d12_command_list_vtbl_embedded_128_16 ||
+             iface->lpVtbl == (struct ID3D12CommandListVtbl *)&d3d12_command_list_vtbl_embedded_default;
+ 
+-    if (!is_valid)
+-        return NULL;
++    /* XCL diagnostic build (ivall/xcl#175): XCL replaces the vtable pointer, accept any table. */
++    (void)is_valid;
+ 
+     return CONTAINING_RECORD(iface, struct d3d12_command_list, ID3D12GraphicsCommandList_iface);
+ }
