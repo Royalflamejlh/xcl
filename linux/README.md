@@ -52,6 +52,7 @@ Left out, because `amd-dev` has the fix in a form of its own:
 | #1599 | `40f499a7` defers the half-full auto-submit for heap page-array batches, and `a0442743` reads a physical-page list again when its request runs |
 | #2762 | `c093211e` "a placed view's padding does not make a second texture" |
 | #2404 | its own chained ExecuteIndirect: `77453544`, `fb81714d`, `6a0bb5b4` and later (`real/dispatch_chain.rs`) |
+| #2936 (`cae11a79`) | `c5951d21` "detach retired segments and reclaim idle aside allocators": its `alloc_pool::retire_recording` has the same body as #2936's `park_list` and is called at #2936's two places in `title_list.rs`; the third, `kickoff_x`'s reclaimed segments, has that call here through #2707's `dff6edc7`. #2936 itself conflicts at all three places |
 
 Not ported: #2633 (split programs' pieces read their slab from a root CBV, less GPU time for each chained
 ExecuteIndirect). It is written on #2404's chain code, which `amd-dev` replaces with its own (33 conflicts), so it would
