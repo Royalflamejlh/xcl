@@ -357,7 +357,10 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
 // window
 // ---------------------------------------------------------------------------------------
 
+pub(crate) mod preparation;
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if let Some(result) = preparation::on_message(hwnd, msg, wp) { return result; }
     // keyboard and mouse as the gamepad: raw mouse input, the cursor held in the window
     if crate::hle::kbm::on_message(hwnd.0, msg, wp.0, lp.0) {
         return LRESULT(0);
@@ -499,10 +502,10 @@ fn window_thread() {
             crate::xlog_error!("could not create the XCL window");
             return;
         };
-        HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
-        crate::hle::kbm::attach(hwnd.0);
+        if !preparation::active() { crate::hle::kbm::attach(hwnd.0); }
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
+        HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -947,7 +950,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let actual_slots = if spare_alloc.is_some() { 2 } else { 1 };
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
     list.Close().ok()?;
-    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+    let fence: ID3D12Fence = super::real::create_raw_fence(dev).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
@@ -1005,6 +1008,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.h = h;
             p.fmt = fmt;
             crate::xlog_info!("present: swap chain {w}x{h} {:?} – the game image will appear in the XCL window", fmt);
+            crate::xlog_info!("present: swap chain window {:#x}", hwnd.0 as usize);
             p.sc.is_some()
         }
         Err(e) => {
