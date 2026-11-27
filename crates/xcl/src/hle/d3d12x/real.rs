@@ -9122,7 +9122,7 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
         f(this, bound as *mut c_void);
     }
     if !pso.is_null() {
-        super::dred::mark_pipeline(this, pso as usize, resolved);
+        super::dred::mark_pipeline(this, pso as usize, bound);
     }
     super::list_x::on_clear_state(this, pso as usize);
     super::bind::clear_state(this, pso as usize);
