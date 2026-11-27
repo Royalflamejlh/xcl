@@ -32,6 +32,8 @@ so its merge brings `main` up to `f9a0cb80`.
 | #2762 | `496ef578` | one texture per view-by-address, not one per padding pattern (#2743) |
 | #2864 | `68cce725` | `XCL_DSTORAGE_CACHE`, an opt-in cache for DirectStorage reads |
 | #1479 | `70364190` | under Wine the final `report.json` is written at the title's exit (#1461) |
+| #2872 | `2dad32e6` | less DXC work per pixel shader (with #688) |
+| #688 | `760f742b` | a private heap per DXC compiler: the launch pass under Wine is no longer held on one shared heap |
 | #867 | `021b2c33` | keeps vkd3d-proton's native vtables and wraps the title's fences (#175) |
 | #2477 | `5225ddcb` | patches the assert-checked vtables in place under Wine (#175) |
 | #794 | `bee31d56` | hides the title's own 1920x1080 window, which Wine does not cloak (it showed white behind XCL's) |
