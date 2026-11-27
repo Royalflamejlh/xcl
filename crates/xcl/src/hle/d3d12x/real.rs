@@ -9451,6 +9451,8 @@ unsafe fn q_copy_page_mappings(count: u32, batches: usize, pool: usize, pool_pag
         }
     }
     S_OK
+}
+
 /// command queue #14 Signal (PC callers, e.g. XCL's own drain/present/sparse helpers)
 unsafe extern "system" fn q_signal_pc(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
@@ -10295,6 +10297,11 @@ mod descriptor_heap_tests {
             assert_eq!(names_of(&sb).0, GONE, "recorded as a destroyed resource's null view");
             dev_copy_descriptors_simple_x(dev.as_raw(), 1, c, b, XBOX_EXTRA_CBV_SRV_UAV);
             assert_eq!((bytes(sc.shared_srv), names_of(&sc).0), (null, GONE), "a copy of the copy");
+        }
+    }
+}
+
+#[cfg(test)]
 mod in_place_tests {
     use super::*;
 
@@ -12283,6 +12290,11 @@ mod depth_uav_twin_tests {
             let rows: Vec<Vec<u8>> = (0..16).map(|y| std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + y * pitch), 16).to_vec()).collect();
             rb.Unmap(0, None);
             assert!(rows.iter().all(|r| r.iter().all(|&v| v == 0x5A)), "the twin was not cleared: {:x?}", &rows[0]);
+        }
+    }
+}
+
+#[cfg(test)]
 mod wine_vtable_tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
