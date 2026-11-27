@@ -79,3 +79,15 @@ and 22, 26 and 27 s on this branch, which has #688 and #2872.
 
 As `linux/stack` (its `linux/README.md`): `VKD3D_CONFIG=ignore_shared_fence` and the same `XCL_` switches. Since
 `926433d8` the direct translator is `amd-dev`'s default for compute, so `XCL_DIRECT_DXIL=1` is not needed.
+
+After a crash the title's own crash handler loads `dbghelp.dll` and calls `MiniDumpWriteDump`, and Wine's dbghelp (11.21
+Staging here) stops in an assertion box, "Assertion failed … dlls/dbghelp/dwarf.c, line 465", that holds the process
+until it is clicked. Turning dbghelp off for the prefix keeps the box away, and XCL's own `CRASH:` report is written
+before that point either way:
+
+```
+wine reg add 'HKCU\Software\Wine\DllOverrides' /v dbghelp /t REG_SZ /d '' /f
+```
+
+(or `dbghelp=d` in `WINEDLLOVERRIDES` for one run). Checked with a small program that does what the handler does; not
+yet with a title crash.
