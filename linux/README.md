@@ -4,14 +4,13 @@
 the branch is built and run on NVIDIA only (RTX 4060 Ti 16 GB, driver 615.71.09, Wine + vkd3d-proton); nobody has run it
 on an AMD card or on RADV.
 
-Updated 2026-11-27. Not run on the title yet: it builds (lib and tests); under Wine on the CPU the ported pull requests'
-lib tests pass (62 of 62, and 49 of 49 of #867's, #2477's and the fence and sparse tests); `gpu::recomp` and `gpu::dxil`
-658 passed and 3 failed, the three `amd-dev` fails by itself (`dispatch_chain_native_wave64_builds_whole`,
-`directed_reference_basics`, `a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier`). The allocator pool,
-`bind` and `list_x` tests: 111 passed and 2 failed, the two `amd-dev` fails by itself there
-(`bitset_runs_emit_exact_contiguous_page_ranges`, `a_dispatch_with_a_pipeline_still_building_waits_at_the_submit`).
-On native Windows (RTX 2070 SUPER 8 GB, driver 621.01), at `9c2edf76`: the card tests of the ported pull requests and the
-vtable, fence and allocator-pool tests, 33 passed and 2 failed, the two `amd-dev` fails by itself there
+Updated 2026-11-27. Not run on the title yet. It builds, and its lib suite was run under Wine on the CPU (lavapipe, one
+test at a time, 1 run each) on vkd3d-proton `master` `71cae091`, unpatched: 1,713 passed, 22 failed, 28 ignored. 21 of
+the 22 fail on `amd-dev` `7c795f5e` itself (with a vkd3d-proton whose vtable checks are relaxed, which it needs); the
+other one, `depth_uav`'s `gpu_d24s8_and_d16s8_enhanced_barrier_twin_sync_passes_equal_depth_test`, calls the runtime's
+`Reset` on an adopted list itself. `amd-dev` alone on that unpatched vkd3d-proton failed 51 tests and then stopped in a
+texture-upload test. The card tests of the ported pull requests ran on native Windows (RTX 2070 SUPER 8 GB, driver
+621.01) at `9c2edf76`: 33 passed and 2 failed, the two `amd-dev` fails by itself there
 (`offline_compute_pipeline_is_reused_by_a_second_process` and its split twin).
 
 ## What it is
@@ -39,6 +38,10 @@ on `main` is merged where that brings no other commit along, and cherry-picked (
 | #2229 | `98a629a3` | cherry-picked from its port `port/2229-amd-dev` `0331600f`: it replaces `amd-dev`'s earlier copy of this pull request (`6e83f828`) with the head, `kernel.rs` kept to `amd-dev`'s API |
 | #2872 | `2dad32e6` | cherry-picked, clean |
 | #688 | `760f742b` | cherry-picked; `amd-dev`'s imports kept beside the new ones; its library link step still makes its linker and utils on the shared heap, only the compilers get a private one |
+
+One commit of ours on top of the #867 port, `de0dcbce`: `amd-dev`'s `ExecuteCommandLists` hook sends XCL's own submits (sparse
+uploads and readbacks, texture uploads) to the PC before the place where #867 restores the lists' native vtables, so it
+restores them there too. Without it the suite above ends in a page fault inside vkd3d-proton's `ExecuteCommandLists`.
 
 Already in `amd-dev`: #1803 (its head `cb007514` is an ancestor).
 
