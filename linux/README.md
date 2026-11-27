@@ -1,8 +1,8 @@
 # XCL on Linux: the stack
 
 The branch that gets XCL furthest on Linux (Wine + vkd3d-proton): `main` plus the open pull requests Linux needs.
-The aim is to run on a stock vkd3d-proton build, with its own dxil-spirv: every fix goes in XCL, nothing in the
-layers. It moves as pull requests merge or new ones help. Measured on NVIDIA (RTX 4060 Ti 16 GB, driver
+The aim is to run on stock vkd3d-proton: `master` `71cae091` (2026-11-25) with its own dxil-spirv `b540c8a2`, no
+patch, and the next release once it ships. Every fix goes in XCL, nothing in the layers. It moves as pull requests merge or new ones help. Measured on NVIDIA (RTX 4060 Ti 16 GB, driver
 615.71.09); AMD / RADV not tested.
 
 Updated 2026-11-27.
@@ -43,8 +43,8 @@ Each one is being replaced by a change in XCL:
 | Patch | What it covers | Replaced by |
 |---|---|---|
 | relaxed vtable checks | vkd3d-proton refuses objects whose vtable XCL replaced (#175) | #867 + #2477, merged here; not yet run on stock vkd3d-proton |
-| command pools release at `Reset` | without it the title ran out of RAM at about 2 minutes (#2404) | an XCL change, not written yet |
-| a local dxil-spirv patch | programs dxil-spirv crashed on | #1860 + #2082 may cover it; not yet checked |
+| command pools release at `Reset` | without it the title ran out of RAM at about 2 minutes (#2404); 48.9 GB by 130 s on this stack | an XCL change, being measured |
+| a local dxil-spirv patch | programs dxil-spirv crashed on | `master`'s dxil-spirv `b540c8a2` converts all of XCL's direct programs; v3.1's (`8b48f0e0`) crashes on most of them |
 
 ## Running it
 
