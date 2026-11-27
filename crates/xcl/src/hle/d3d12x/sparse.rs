@@ -1026,13 +1026,13 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         crate::xlog_warn!("sparse windows: XCL_SPARSE_LAZY=1 is left out - on this device a tile with no video memory does not read zeros (tiled resources tier under 2)");
     }
     let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
-    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-    let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+    let fence: ID3D12Fence = super::real::create_raw_fence(dev)?;
+    let rb_fence: ID3D12Fence = super::real::create_raw_fence(dev)?;
     let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
     let rbq = (|| -> windows::core::Result<(ID3D12CommandQueue, ID3D12Fence)> {
         let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
         let _ = q.SetName(windows::core::w!("xcl sparse readback queue"));
-        Ok((q, dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?))
+        Ok((q, super::real::create_raw_fence(dev)?))
     })()
     .ok();
     let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
@@ -2592,7 +2592,7 @@ impl State {
             // on this queue: [the title's lists] Signal(first, v) [the copies] Signal(second, v)
             let key = queue.as_raw() as usize;
             if !s.rb_queue_fences.contains_key(&key) {
-                let (Ok(a), Ok(b)) = (s.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE), s.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)) else { return };
+                let (Ok(a), Ok(b)) = (super::real::create_raw_fence(&s.dev), super::real::create_raw_fence(&s.dev)) else { return };
                 s.rb_queue_fences.insert(key, (a, b, 0));
             }
             let (fences, v) = {
@@ -2995,7 +2995,7 @@ impl State {
         if q.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != self.dev.as_raw()) {
             return true;
         }
-        match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+        match super::real::create_raw_fence(&self.dev) {
             Ok(fence) => {
                 self.queue_fences.insert(key, (q.clone(), fence, 0));
                 true
