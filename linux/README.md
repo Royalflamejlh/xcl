@@ -28,6 +28,7 @@ so its merge brings `main` up to `f9a0cb80`.
 | #2753 | `e07d03bf` | 3-D LUT pages: no white overexposure |
 | #2551 | `3567b2ef` | XCL's pipeline blob cache |
 | #2070 | `8cb43460` | 64 MB stacks for offline pipeline builds (a dxil-spirv stack overflow) |
+| #1368 | `92ef1316` | pipelines built with `NodeMask` 0, so vkd3d-proton takes the offline pass's blobs (#2453) |
 | #867 | `021b2c33` | keeps vkd3d-proton's native vtables and wraps the title's fences (#175) |
 | #2477 | `5225ddcb` | patches the assert-checked vtables in place under Wine (#175) |
 | #794 | `bee31d56` | hides the title's own 1920x1080 window, which Wine does not cloak (it showed white behind XCL's) |
