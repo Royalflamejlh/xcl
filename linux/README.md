@@ -55,7 +55,11 @@ Not ported: #2633 (split programs' pieces read their slab from a root CBV, less 
 ExecuteIndirect). It is written on #2404's chain code, which `amd-dev` replaces with its own (33 conflicts), so it would
 be a rewrite there and needs a card to check.
 
-With #867 + #2477 in, it is meant for stock vkd3d-proton as `linux/stack` is (`master` `71cae091`); not run yet.
+With #867 + #2477 in, it is meant for stock vkd3d-proton as `linux/stack` is (`master` `71cae091`); not run on it yet.
+What was checked on the CPU, at `9b670905`: every compute program the launch pass translates goes through that
+vkd3d-proton's dxil-spirv (`b540c8a2`) and its output passes `spirv-val`: 1,613 of 1,613 as a run gets them (the 1,073
+ray-tracing programs `XCL_RT_GATE` holds back left out), 2,682 of 2,682 with `XCL_RT_GATE=0`, and 1,613 of 1,613 unsplit;
+the same through `788f3e22` (vkd3d-proton `256f7510`). 1 pass each.
 
 ## Running it
 
