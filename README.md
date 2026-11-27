@@ -323,6 +323,15 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   fills into its GPU views) are applied: a GPU-view page shows the physical page mapped into it.
   `XCL_PAGE_MAPPINGS=0` turns them off (the call is ignored and a GPU-view page shows its CPU view at
   the same offset, as before).
+- `XCL_DSTORAGE_CACHE=<folder>` keeps the unpacked bytes of DirectStorage file requests (zlib
+  and BCPack) on disk and reads them back when the same request comes again, in the same run or
+  a later one, instead of decoding it on the CPU again. A file that changes (size or modification
+  time) gets new entries. Nothing is evicted: entries stop being added once the folder holds
+  `XCL_DSTORAGE_CACHE_MB` (default 32,768). Requests decoded by `XCL_DSTORAGE_PARALLEL_DECOMPRESS`
+  do not use it. New entries are written by a thread of their own; while 256 MiB wait to be
+  written, more are not kept. Each entry is checked against its Adler-32 when read back
+  (`XCL_DSTORAGE_CACHE_VERIFY=0` skips the check). `report.json` → `dstorage.unpack_cache` counts hits and stored
+  entries.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
