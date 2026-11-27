@@ -10,6 +10,9 @@ lib tests pass (62 of 62, and 49 of 49 of #867's, #2477's and the fence and spar
 `directed_reference_basics`, `a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier`). The allocator pool,
 `bind` and `list_x` tests: 111 passed and 2 failed, the two `amd-dev` fails by itself there
 (`bitset_runs_emit_exact_contiguous_page_ranges`, `a_dispatch_with_a_pipeline_still_building_waits_at_the_submit`).
+On native Windows (RTX 2070 SUPER 8 GB, driver 621.01), at `9c2edf76`: the card tests of the ported pull requests and the
+vtable, fence and allocator-pool tests, 33 passed and 2 failed, the two `amd-dev` fails by itself there
+(`offline_compute_pipeline_is_reused_by_a_second_process` and its split twin).
 
 ## What it is
 
