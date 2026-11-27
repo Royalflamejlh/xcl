@@ -42,7 +42,7 @@ Each one is being replaced by a change in XCL:
 
 | Patch | What it covers | Replaced by |
 |---|---|---|
-| relaxed vtable checks | vkd3d-proton refuses objects whose vtable XCL replaced (#175) | #867 + #2477, merged here; not yet run on stock vkd3d-proton |
+| relaxed vtable checks | vkd3d-proton refuses objects whose vtable XCL replaced (#175) | #867 + #2477, merged here: on stock `master` no refusal or assertion |
 | command pools release at `Reset` | without it the title ran out of RAM at about 2 minutes (#2404); 48.9 GB by 130 s on this stack | an XCL change, being measured |
 | a local dxil-spirv patch | programs dxil-spirv crashed on | `master`'s dxil-spirv `b540c8a2` converts all of XCL's direct programs; v3.1's (`8b48f0e0`) crashes on most of them |
 
@@ -55,6 +55,9 @@ Warm the driver's shader cache first (an offline `xcl shaders --precompile --onl
 cold cache the title spends minutes with no picture while the driver builds pipelines.
 
 ## How far it gets
+
+On stock vkd3d-proton `master` (1 run, `XCL_PREPARE=0 XCL_SKIP_BINK=1`): the world load at 57.5 s and presents to
+90 s, when the run was stopped at 30 GB of RSS: the command-pool memory above, still to be fixed in XCL.
 
 Measured before #867 and #2477 came in, with the vkd3d-proton patches. On the RTX 4060 Ti: the world load at about
 53 s, the intro to about 520 s (colour banding), then black frames from about 529 s, with the movement hint at about
