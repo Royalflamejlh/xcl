@@ -32,6 +32,8 @@ on `main` is merged where that brings no other commit along, and cherry-picked (
 | #1975 | `72960386` | cherry-picked from its port `port/1975-amd-dev` `62379faf` |
 | #2070 | `d6bd4170` | cherry-picked from its port `port/2070-amd-dev` `a88477cb`: `WORKER_STACK` is 16 MB there, `amd-dev`'s own worker stack |
 | #2229 | `98a629a3` | cherry-picked from its port `port/2229-amd-dev` `0331600f`: it replaces `amd-dev`'s earlier copy of this pull request (`6e83f828`) with the head, `kernel.rs` kept to `amd-dev`'s API |
+| #2872 | `2dad32e6` | cherry-picked, clean |
+| #688 | `760f742b` | cherry-picked; `amd-dev`'s imports kept beside the new ones; its library link step still makes its linker and utils on the shared heap, only the compilers get a private one |
 
 Already in `amd-dev`: #1803 (its head `cb007514` is an ancestor).
 
