@@ -190,6 +190,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if let Some(over) = crate::hle::d3d12x::real::over_video_budget(local, budget) {
                     crate::xlog_warn!("video memory: {} MB in use, {} MB over the budget of {} MB Windows gives this process", mb(local), mb(over), mb(budget));
                 }
+                // the textures made for views without a resource object (#2743)
+                let views = crate::hle::d3d12x::real::view_textures();
+                if views > 0 {
+                    crate::xlog_info!("views without a resource: {views} textures kept");
+                }
                 last = now;
             }
         });
