@@ -5,7 +5,8 @@ the branch is built and run on NVIDIA only (RTX 4060 Ti 16 GB, driver 615.71.09,
 on an AMD card or on RADV.
 
 Updated 2026-11-27. Not run on the title yet: it builds (lib and tests); under Wine on the CPU the ported pull requests'
-lib tests pass (62 of 62), and the GPU tests of #1368 and #2551 were skipped there (no card).
+lib tests pass (62 of 62, and 49 of 49 of #867's, #2477's and the fence and sparse tests); the GPU tests of #1368 and
+#2551 were skipped there (no card).
 
 ## What it is
 
@@ -24,6 +25,8 @@ on `main` is merged where that brings no other commit along, and cherry-picked (
 | #684 | `e56dbc3f` | cherry-picked; both sides' tests kept in `xg.rs` |
 | #2551 | `3567b2ef` | cherry-picked; `make_one` takes the record on `amd-dev`, and the launch pass's own whole-form call stays |
 | #2753 | `e07d03bf` | cherry-picked; `place()` on `amd-dev` keeps the XG texture it laid out, so the size comes from that one, with the same fall-back for a 3-D target |
+| #867 | `021b2c33` | cherry-picked; `amd-dev`'s class tables are RwLocks, its own code stays around each guarded PC call, and the fences it added since (sparse's `rb_done_fence` and per-queue fences, vram's retire queue, `console_heap`'s queue fences) are raw ones too |
+| #2477 | `5225ddcb` | cherry-picked on #867; `make_class` keeps `amd-dev`'s `find_matching_class`, and a class patched in place has no copied snapshot |
 
 Already in `amd-dev`: #1803 (its head `cb007514` is an ancestor).
 
@@ -40,12 +43,11 @@ Not ported yet (each conflicts with `amd-dev`'s own code and needs a port, not a
 
 | Pull request | Why it is wanted | State |
 |---|---|---|
-| #867 + #2477 | stock vkd3d-proton: native vtables kept, fences wrapped, assert-checked vtables patched in place | 11 hunks in `real.rs`, `sparse.rs`, `vram.rs` |
 | #2707 | the allocator pool's reset races (no device loss on `linux/stack`) | its first commit is in `amd-dev` (`78799549`); the other five conflict in `alloc_pool.rs`, `bind.rs`, `real.rs` |
 | #2633 | split programs' pieces read their slab from a root CBV | 33 hunks against `amd-dev`'s own chain code |
 | #2229, #1975, #2070 | the shader-side fixes | ported separately |
 
-Until #867 + #2477 are in, this branch needs a vkd3d-proton with the relaxed vtable checks, as `amd-dev` itself does.
+With #867 + #2477 in, it is meant for stock vkd3d-proton as `linux/stack` is (`master` `71cae091`); not run yet.
 
 ## Running it
 
