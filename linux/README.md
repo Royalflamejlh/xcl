@@ -30,6 +30,8 @@ so its merge brings `main` up to `f9a0cb80`.
 | #2070 | `8cb43460` | 64 MB stacks for offline pipeline builds (a dxil-spirv stack overflow) |
 | #867 | `021b2c33` | keeps vkd3d-proton's native vtables and wraps the title's fences (#175) |
 | #2477 | `5225ddcb` | patches the assert-checked vtables in place under Wine (#175) |
+| #794 | `bee31d56` | hides the title's own 1920x1080 window, which Wine does not cloak (it showed white behind XCL's) |
+| #1462 | `813615c9` | the e2e title's cloak check accepts that hidden window |
 
 Merge conflicts were resolved by keeping both sides; see each merge commit.
 
