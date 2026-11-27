@@ -5,8 +5,9 @@ the branch is built and run on NVIDIA only (RTX 4060 Ti 16 GB, driver 615.71.09,
 on an AMD card or on RADV.
 
 Updated 2026-11-27. Not run on the title yet: it builds (lib and tests); under Wine on the CPU the ported pull requests'
-lib tests pass (62 of 62, and 49 of 49 of #867's, #2477's and the fence and sparse tests); the GPU tests of #1368 and
-#2551 were skipped there (no card).
+lib tests pass (62 of 62, and 49 of 49 of #867's, #2477's and the fence and sparse tests); `gpu::recomp` and `gpu::dxil`
+658 passed and 3 failed, the three `amd-dev` fails by itself (`dispatch_chain_native_wave64_builds_whole`,
+`directed_reference_basics`, `a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier`).
 
 ## What it is
 
@@ -28,6 +29,9 @@ on `main` is merged where that brings no other commit along, and cherry-picked (
 | #867 | `021b2c33` | cherry-picked; `amd-dev`'s class tables are RwLocks, its own code stays around each guarded PC call, and the fences it added since (sparse's `rb_done_fence` and per-queue fences, vram's retire queue, `console_heap`'s queue fences) are raw ones too |
 | #2477 | `5225ddcb` | cherry-picked on #867; `make_class` keeps `amd-dev`'s `find_matching_class`, and a class patched in place has no copied snapshot |
 | #2707 | `1a3b6981` | in part: of its six commits, `78799549` is in `amd-dev` already and `f796b9e6` is there as `5568d655` (`backing_allocator`); `068671d5` (the reset guard) and `dff6edc7` are cherry-picked, clean; `59cc732a` and `1a3b6981` are left out: `amd-dev` holds a released allocator's busy backings its own way (`pending_releases`), and the last builds on the other's orphan list |
+| #1975 | `72960386` | cherry-picked from its port `port/1975-amd-dev` `62379faf` |
+| #2070 | `d6bd4170` | cherry-picked from its port `port/2070-amd-dev` `a88477cb`: `WORKER_STACK` is 16 MB there, `amd-dev`'s own worker stack |
+| #2229 | `98a629a3` | cherry-picked from its port `port/2229-amd-dev` `0331600f`: it replaces `amd-dev`'s earlier copy of this pull request (`6e83f828`) with the head, `kernel.rs` kept to `amd-dev`'s API |
 
 Already in `amd-dev`: #1803 (its head `cb007514` is an ancestor).
 
@@ -45,7 +49,6 @@ Not ported yet (each conflicts with `amd-dev`'s own code and needs a port, not a
 | Pull request | Why it is wanted | State |
 |---|---|---|
 | #2633 | split programs' pieces read their slab from a root CBV | 33 hunks against `amd-dev`'s own chain code |
-| #2229, #1975, #2070 | the shader-side fixes | ported separately |
 
 With #867 + #2477 in, it is meant for stock vkd3d-proton as `linux/stack` is (`master` `71cae091`); not run yet.
 
