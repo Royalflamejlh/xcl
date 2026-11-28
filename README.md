@@ -248,7 +248,7 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   XCL prepares supported shader stages and compute pipelines, including
   split pieces and their whole fallback. Graphics pipelines are created during play the first
   time; the ones a run used are recorded with their state (`used-graphics-pipelines.bin` beside
-  the shader cache, at most `XCL_GFX_RECORDS_MB`, default 64) and built before the title starts
+  the shader cache, or `-lockhart` variants under Series S `lockhart`, at most `XCL_GFX_RECORDS_MB`, default 64) and built before the title starts
   on the next launch, with their driver blobs kept, so the title makes them from those in
   milliseconds. `XCL_PREPARE_GRAPHICS=0` leaves that pass out. Later launches reuse matching cache entries.
   Closing the window cancels the launch. A compiler or driver failure stops it and reports
@@ -282,6 +282,10 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
     for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
     default.
+- Retired two-pass mesh buffers from tracked command lists can be reused once all GPU
+  submissions that used them complete, even while the title still holds the command allocator.
+- Direct two-pass mesh draws can reuse one smaller record buffer across several slices when
+  the memory cap is tight. Each slice keeps the draw's original mesh group IDs.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
