@@ -2182,7 +2182,13 @@ fn prepare_workers() -> usize {
     }
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let (used, limit) = crate::host::system_commit();
-    workers_for(cores, limit.saturating_sub(used))
+    workers_for_commit(cores, used, limit)
+}
+
+/// The workers for `cores` logical processors and the system's commit charge `used` and its
+/// `limit`, both in bytes as `host::system_commit` gives them.
+fn workers_for_commit(cores: usize, used: u64, limit: u64) -> usize {
+    workers_for(cores, limit.saturating_sub(used) >> 20)
 }
 
 /// The workers for `cores` logical processors (threads, not cores) and `free_mb` of commit left.
@@ -3312,6 +3318,17 @@ mod tests {
         assert_eq!(workers_for(2, 100_000), 1);
         assert_eq!(workers_for(64, 1_000_000), 32);
         assert_eq!(workers_for(32, 0), 1);
+    }
+
+    /// The commit figures come in bytes: 6 GiB left on 16 logical processors is room for two
+    /// workers, not twelve; a commit that is not known (0, 0) gives one.
+    #[test]
+    fn preparation_workers_take_the_commit_left_in_bytes() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(workers_for_commit(16, 10 * GIB, 16 * GIB), 2);
+        assert_eq!(workers_for_commit(16, 0, 64 * GIB), 12);
+        assert_eq!(workers_for_commit(16, 0, 0), 1);
+        assert_eq!(workers_for_commit(16, 20 * GIB, 16 * GIB), 1);
     }
 
     /// A builder's progress line gives its record count; its other lines give none.
