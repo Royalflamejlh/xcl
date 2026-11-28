@@ -10,6 +10,11 @@ Updated 2026-11-27.
 `nvidia-dev` `d1be8103` with these pull requests. They are `main`-based, so the merged ones also bring the `main`
 commits `nvidia-dev` lacks.
 
+On 2026-11-27 `nvidia-dev` `ba9d1f94` (48 commits, among them #2815, #2816 and #2749) was merged on top, with one line of ours for
+#2816: its feedback copy list is unadopted for its submit (`bind.rs:2522`). Without that line the title stopped at
+`d3d12core.dll+0x563fad` in 2 of 2 runs on an RTX 4070; with it, 1 run there ended at 118 s in a device removal with the
+card's 12 GB full. Not yet run on the RTX 4060 Ti.
+
 | Pull request | Head | How it went in |
 |---|---|---|
 | #684 | `e56dbc3f` | merged |
