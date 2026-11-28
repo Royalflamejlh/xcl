@@ -42,6 +42,9 @@ so its merge brings `main` up to `f9a0cb80`.
 | #1462 | `813615c9` | the e2e title's cloak check accepts that hidden window |
 | #3085 | `651867a4` | the launch pass's worker count follows the memory left (#2705 for `main`): under Wine on 32 threads it ran 28 workers and went over 34 GB |
 | #3086 | `fdbac840` | the pass's verified compute blobs are kept when the worker count changes |
+| #3090 | `b3e67617` | keeps barriers carrying console hint flags (cherry-picked from its `nvidia-dev` branch; its test calls `runner::device`, which `main` lacks, so the tests do not compile here) |
+| #3091 | `64aa28f0` | derived pipelines keep the shared bytecode (cherry-picked from its `nvidia-dev` branch) |
+| #3092 | `d40a1540` | a 2 MiB grain for allocator page size two (cherry-picked from its `nvidia-dev` branch) |
 
 Merge conflicts were resolved by keeping both sides; see each merge commit.
 
