@@ -1174,7 +1174,7 @@ impl Module {
                 while let Some(&term_i) = self.blocks[a].last() {
                     let Op::Br(b_blk) = self.insts[term_i as usize].op else { break };
                     let b = b_blk.0 as usize;
-                    if b == 0 || b == a || self.blocks[b].is_empty() || pred_edges[b] != 1 {
+                    if b == 0 || b == a || self.blocks[b].is_empty() || pred_edges[b] != 1 || self.preserve_block_boundary[b] {
                         break;
                     }
                     // Verify every leading phi in `b` has an incoming value from `a` before mutating.
@@ -1503,6 +1503,31 @@ mod tests {
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
         assert_eq!(count_calls(&m, sink), 1);
+    }
+
+    #[test]
+    fn simplify_cfg_keeps_preserved_block_boundary() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let guarded = m.new_block();
+        let exit = m.new_block();
+        m.preserve_block_boundary(guarded);
+
+        let void = m.void();
+        let sink_ty = m.func_ty(void, &[]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        m.br(guarded);
+        m.set_block(guarded);
+        m.call(sink, &[]);
+        m.br(exit);
+        m.set_block(exit);
+        m.ret();
+
+        m.optimize();
+        assert_eq!(reachable_blocks(&m), 2, "preserved boundary should survive linear block merging");
     }
 
     #[test]

@@ -12,7 +12,7 @@ Updated 2026-11-27.
 `main` `b49be18` with these pull requests merged, in this order, at these heads. #2477 (with #867) sits on `main` `f9a0cb80`,
 so its merge brings `main` up to `f9a0cb80`.
 `main` `753e8b1a` (2026-11-27, with #3057) is merged on top. Run its launch pass with `XCL_PREPARE_WORKERS=8` until #3085 is in a run here.
-`main` `e429936c` (2026-11-27, with #2959, #2872, #3085 and #3086) is merged on top of that. #2959 replaced the chained
+`main` `309c3ec5` (2026-11-28, with #2959, #2872, #3085, #3086 and #1809) is merged on top of that. #2959 replaced the chained
 `ExecuteIndirect` of #2404 and #2633 and the allocator reclaim of #2707, so those three leave the table. A split
 program's `ExecuteIndirect` now runs its pieces only once its indirect set (pieces and whole form on the CBV root, built on
 one background thread) is ready; until then it runs the whole form, built on the title's thread (#2404 ran the pieces

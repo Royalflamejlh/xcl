@@ -256,6 +256,7 @@ pub struct Module {
     insts: Vec<InstDef>,
     def_block: Vec<Block>,
     blocks: Vec<Vec<u32>>,
+    preserve_block_boundary: Vec<bool>,
     cur: Block,
     insert_before_term: bool,
     md: Vec<MdDef>,
@@ -284,6 +285,7 @@ impl Module {
             insts: Vec::new(),
             def_block: Vec::new(),
             blocks: vec![Vec::new()],
+            preserve_block_boundary: vec![false],
             cur: Block(0),
             insert_before_term: false,
             md: Vec::new(),
@@ -519,7 +521,12 @@ impl Module {
 
     pub fn new_block(&mut self) -> Block {
         self.blocks.push(Vec::new());
+        self.preserve_block_boundary.push(false);
         Block(self.blocks.len() as u32 - 1)
+    }
+    /// Prevents CFG simplification from merging this block into its predecessor.
+    pub fn preserve_block_boundary(&mut self, b: Block) {
+        self.preserve_block_boundary[b.0 as usize] = true;
     }
     pub fn entry_block(&self) -> Block {
         Block(0)

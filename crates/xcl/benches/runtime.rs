@@ -608,10 +608,8 @@ fn manifest_and_config_benches(c: &mut Criterion) {
     let mut mounts = BTreeMap::new();
     mounts.insert("GAME:".to_owned(), "{game}".to_owned());
     mounts.insert("S:".to_owned(), "{data}\\pls".to_owned());
-    let mut resolved = Config {
-        mounts,
-        ..Config::default()
-    };
+    let mut resolved = Config::default();
+    resolved.mounts = mounts;
     resolved.resolve(Some(&parsed_manifest));
     group.throughput(Throughput::Elements(1));
     group.bench_function("resolved_memory_queries", |b| {

@@ -1316,11 +1316,23 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
     unsafe { dev9.ShaderCacheControl(cache_kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) }
         .map_err(|e| Unavailable(format!("cannot disable the driver cache (Windows Developer Mode is required): {e}")))?;
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::pso::wave32_only_for_device(&pipeline.dev));
-    let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split, false).map_err(|e| Failed(format!("{name}: {e}")))?;
     let dxc_start = std::time::Instant::now();
-    let dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).map_err(|e| Failed(format!("DXC: {e}")))?;
+    // `XCL_DIRECT_DXIL=1`: the direct translator's container instead (no HLSL fallback, so the
+    // number is never silently the other path's)
+    let (dxil, samplers) = if crate::gpu::dxil::kernel::enabled() {
+        let c = recomp::pso::direct_compute(&blob, 0, windows, split).map_err(|e| Failed(format!("{name}: direct: {e}")))?;
+        (c.dxil, c.samplers)
+    } else {
+        let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split, false).map_err(|e| Failed(format!("{name}: {e}")))?;
+        let dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).map_err(|e| Failed(format!("DXC: {e}")))?;
+        (dxil, translation.static_samplers)
+    };
     let dxc_ms = dxc_start.elapsed().as_millis();
-    let rs = recomp::pso::abi_root_signature_with(&pipeline.dev, true, &translation.static_samplers).map_err(|e| Failed(format!("root signature: {e}")))?;
+    // `XCL_MEASURE_DUMP=<dir>`: the measured container as <hash>.<path>.dxil there
+    if let Ok(dir) = std::env::var("XCL_MEASURE_DUMP") {
+        let _ = std::fs::write(Path::new(&dir).join(format!("{hash:016x}.{}.dxil", if crate::gpu::dxil::kernel::enabled() { "direct" } else { "hlsl" })), &dxil);
+    }
+    let rs = recomp::pso::abi_root_signature_with(&pipeline.dev, true, &samplers).map_err(|e| Failed(format!("root signature: {e}")))?;
     let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
         CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
@@ -1350,7 +1362,8 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
     times.sort_by(f64::total_cmp);
     let median = if times.len() & 1 == 0 { (times[times.len() / 2 - 1] + times[times.len() / 2]) / 2.0 } else { times[times.len() / 2] };
     println!(
-        "PSO {hash:016x}: {} bytes DXIL, {dxc_ms} ms DXC, {repeat} cache-off run(s), median {:.3} s, min {:.3} s, max {:.3} s, {name}",
+        "PSO {hash:016x} [{}]: {} bytes DXIL, {dxc_ms} ms translate, {repeat} cache-off run(s), median {:.3} s, min {:.3} s, max {:.3} s, {name}",
+        if crate::gpu::dxil::kernel::enabled() { "direct" } else { "hlsl" },
         dxil.len(),
         median,
         times[0],

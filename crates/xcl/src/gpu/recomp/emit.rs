@@ -5244,7 +5244,9 @@ impl Em {
                     let _ = writeln!(h, "    uint xcl_limit_{c} = io.Load({slot}u);\n    xcl_dispatch_limited = xcl_dispatch_limited || xcl_limit_{c} != 0u;");
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0;");
-                let _ = writeln!(h, "        if (xcl_dispatch_limited) {{\n            bool xcl_dispatch_live = true;");
+                // The limits are uniform I/O values. Make that explicit so a split-wave
+                // rendezvous is not compiled inside lane-divergent control flow.
+                let _ = writeln!(h, "        if (WaveActiveAllTrue(xcl_dispatch_limited)) {{\n            bool xcl_dispatch_live = true;");
                 for (k, c) in ["x", "y", "z"].iter().enumerate().filter(|(k, _)| cs.threads[*k] > 1) {
                     let group = match remap {
                         Some((ratio, dim, _)) if dim == k => format!("(gid.{c} / {ratio}u)"),
