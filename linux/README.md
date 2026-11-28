@@ -42,6 +42,7 @@ without it). #751's commit has been in `main` since #2844 (`fa671a2f`), so it le
 | #1462 | `813615c9` | the e2e title's cloak check accepts that hidden window |
 | #3154 | `bacb6f04` | compute programs with a static sampler get direct DXIL again: `main`'s DispatchX prologue (`d9403543`) sent 567 of the title's 1,636 to HLSL |
 | (ours) | `c49ab7c9` | the same for a compute program's scratch (offered on #3154) |
+| (ours, stack only) | `b7f0f86f` | multidimensional compute groups take direct DXIL as before `d9403543`, without its console-linear thread reorder: the HLSL builds of 895 such programs reached 43.8 GB in one launch-pass worker under Wine |
 | #3090 | `b3e67617` | keeps barriers carrying console hint flags (cherry-picked from its `nvidia-dev` branch, with `nvidia-dev`'s `runner::device` for its test) |
 | #3091 | `64aa28f0` | derived pipelines keep the shared bytecode (cherry-picked from its `nvidia-dev` branch) |
 | #3092 | `d40a1540` | a 2 MiB grain for allocator page size two (cherry-picked from its `nvidia-dev` branch, with `nvidia-dev`'s `Uma::block_len` for its test) |
