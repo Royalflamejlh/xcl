@@ -269,7 +269,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   launch when the null renderer is selected. For an unstaged title set `XCL_PREPARE=0`
   to skip startup preparation, or `XCL_PREPARE_GRAPHICS=0` to skip optional graphics history.
   Native recipes validated on this adapter and driver reuse their verified blobs across
-  rebuilds. Changes to translation, pipeline layout, settings or cache files trigger validation.
+  rebuilds. Compute verification also survives changes to the preparation worker count.
+  Changes to translation, pipeline layout, settings or cache files trigger validation.
 - To prepare known graphics, two-pass mesh and compute recipes offline, use a local
   [archive layout profile](scripts/pso_corpus/archive-profile.md) with the following commands.
   The staging command accepts several journals, deduplicates their recipes and atomically publishes
