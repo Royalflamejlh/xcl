@@ -2387,11 +2387,13 @@ impl Lw {
             Some(a) => a,
             None => {
                 let cur = self.cur();
+                let before = self.s.m.set_insert_before_term(true);
                 self.s.m.set_block(self.init.entry);
                 let i32 = self.s.m.i32();
                 let t = self.s.m.array(1024, i32);
                 let a = self.s.m.alloca(t, 4);
                 self.s.m.set_block(cur);
+                self.s.m.set_insert_before_term(before);
                 self.scratch = Some(a);
                 a
             }

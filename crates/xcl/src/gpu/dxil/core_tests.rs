@@ -650,6 +650,20 @@ fn direct_loads_read_the_constant_data(at_the_table: bool) {
     }
 }
 
+#[test]
+fn compute_scratch_is_allocated_before_the_dispatch_limit_guard() {
+    use crate::gpu::recomp::CsInterface;
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 133)], None),
+        ("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0x7F)], None),
+        ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 0), ("VDST", 2), ("SADDR", 0x7F)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+    ]);
+    let cs = CsInterface { threads: [64, 1, 1], ..Default::default() };
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    super::kernel::translate_compute(&code, ko, &cs).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+}
+
 /// `image_get_lod` with a static sampler (an S# built from constants in the code) translates
 /// to `CalculateLevelOfDetail` on the sampler bound at `s<i>, space1`, shared with a sample of
 /// the same S#, and validates.
