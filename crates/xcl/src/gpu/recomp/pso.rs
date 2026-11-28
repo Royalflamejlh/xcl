@@ -1162,9 +1162,6 @@ pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
-    if direct_compute_needs_hlsl(&cs) {
-        return Err("multidimensional groups need the HLSL console-linear thread reorder".into());
-    }
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     // the constant data the program reads from its own code region (`Options::rodata`)
@@ -1189,19 +1186,6 @@ pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split
     let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Compute(cs), &rodata)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers, dispatch_remap: None })
-}
-
-fn direct_compute_needs_hlsl(cs: &super::CsInterface) -> bool {
-    cs.threads[1] > 1 || cs.threads[2] > 1
-}
-
-#[cfg(test)]
-#[test]
-fn direct_compute_routes_multidimensional_thread_groups_to_hlsl() {
-    let cs = |threads| super::CsInterface { threads, user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 3 };
-    assert!(!direct_compute_needs_hlsl(&cs([64, 1, 1])));
-    assert!(direct_compute_needs_hlsl(&cs([8, 8, 1])));
-    assert!(direct_compute_needs_hlsl(&cs([4, 4, 4])));
 }
 
 /// `XCL_DXIL_DUMP=<hash>[,<hash>…]` (`[SHADER]` hashes, or `all`): writes the direct path's
