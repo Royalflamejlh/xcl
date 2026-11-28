@@ -12,7 +12,7 @@ Updated 2026-11-27.
 `main` `b49be18` with these pull requests merged, in this order, at these heads. #2477 (with #867) sits on `main` `f9a0cb80`,
 so its merge brings `main` up to `f9a0cb80`.
 `main` `753e8b1a` (2026-11-27, with #3057) is merged on top. Run its launch pass with `XCL_PREPARE_WORKERS=8` until #3085 is in a run here.
-`main` `309c3ec5` (2026-11-28, with #2959, #2872, #3085, #3086 and #1809) is merged on top of that. #2959 replaced the chained
+`main` `bb9a6b4b` (2026-11-28, with #2959, #2872, #3085, #3086 and #1809) is merged on top of that. #2959 replaced the chained
 `ExecuteIndirect` of #2404 and #2633 and the allocator reclaim of #2707, so those three leave the table. A split
 program's `ExecuteIndirect` now runs its pieces only once its indirect set (pieces and whole form on the CBV root, built on
 one background thread) is ready; until then it runs the whole form, built on the title's thread (#2404 ran the pieces
@@ -40,6 +40,8 @@ without it). #751's commit has been in `main` since #2844 (`fa671a2f`), so it le
 | #2477 | `5225ddcb` | patches the assert-checked vtables in place under Wine (#175) |
 | #794 | `bee31d56` | hides the title's own 1920x1080 window, which Wine does not cloak (it showed white behind XCL's) |
 | #1462 | `813615c9` | the e2e title's cloak check accepts that hidden window |
+| #3154 | `bacb6f04` | compute programs with a static sampler get direct DXIL again: `main`'s DispatchX prologue (`d9403543`) sent 567 of the title's 1,636 to HLSL |
+| (ours) | `c49ab7c9` | the same for a compute program's scratch (offered on #3154) |
 | #3090 | `b3e67617` | keeps barriers carrying console hint flags (cherry-picked from its `nvidia-dev` branch, with `nvidia-dev`'s `runner::device` for its test) |
 | #3091 | `64aa28f0` | derived pipelines keep the shared bytecode (cherry-picked from its `nvidia-dev` branch) |
 | #3092 | `d40a1540` | a 2 MiB grain for allocator page size two (cherry-picked from its `nvidia-dev` branch, with `nvidia-dev`'s `Uma::block_len` for its test) |
