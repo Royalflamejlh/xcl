@@ -1040,16 +1040,19 @@ impl Lw {
                 let cb = self.lane_of(l, h);
                 let cin = self.u(cb);
                 let (x, y) = if name == "v_subrev_co_ci_u32" { (b, a) } else { (a, b) };
-                let (x6, y6, c6) = (self.zext64(x), self.zext64(y), self.zext64(cin));
-                let w = if name == "v_add_co_ci_u32" {
-                    let s = self.add(x6, y6);
-                    self.add(s, c6)
+                let (t, carry) = if name == "v_add_co_ci_u32" {
+                    let t0 = self.add(x, y);
+                    let t = self.add(t0, cin);
+                    let c0 = self.cmp(Pred::ULt, t0, x);
+                    let c1 = self.cmp(Pred::ULt, t, t0);
+                    (t, self.lor(c0, c1))
                 } else {
-                    let s = self.sub(x6, y6);
-                    self.sub(s, c6)
+                    let t0 = self.sub(x, y);
+                    let t = self.sub(t0, cin);
+                    let c0 = self.cmp(Pred::ULt, x, y);
+                    let c1 = self.cmp(Pred::ULt, t0, cin);
+                    (t, self.lor(c0, c1))
                 };
-                let (t, hi) = self.unpack64(w);
-                let carry = self.nz(hi);
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
                 self.write_mask(&sdst, carry);
                 self.vwrite(d, &dst, t);
@@ -1482,43 +1485,111 @@ mod fidelity_tests {
         let dis = validate::disassemble(&k.dxil).expect("DXIL disassemble failed");
         assert!(dis.contains("and i32") && dis.contains(", 255"), "expected M0 & 255 mask in DXIL:\n{dis}");
     }
+}
+
+#[cfg(test)]
+mod valu_carry_tests {
+    use super::super::kernel::{self, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner;
 
     #[test]
-    fn direct_dxil_mesh_non_uniform_barrier_guard() {
-        use crate::gpu::dxbc::SigElement;
-        use crate::gpu::dxil::kernel::translate_mesh;
-        use crate::gpu::recomp::MsInterface;
+    fn valu_carry_ops_avoid_i64_and_match_gpu() {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in &[
+            // v2 = v0 + v1 + cin(s0), carry -> s2
+            ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 2u64), ("SDST", 2), ("SRC0", 256), ("SRC1", 257), ("SRC2", 0)][..]),
+            // v3 = v0 - v1 - cin(s0), borrow -> s4
+            ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 3), ("SDST", 4), ("SRC0", 256), ("SRC1", 257), ("SRC2", 0)]),
+            // v4 = v1 - v0 - cin(s0), borrow -> s6
+            ("V_SUBREV_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 4), ("SDST", 6), ("SRC0", 256), ("SRC1", 257), ("SRC2", 0)]),
+        ] {
+            code.extend(encode(name, enc, fields, None).unwrap_or_else(|e| panic!("{name}: {e}")));
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
 
-        let ms = MsInterface {
-            outputs: vec![SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
-            threads: 128,
-            max_vertices: 64,
-            max_primitives: 64,
-        };
-        let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = kernel::translate(&code, ko).expect("translate valu carry ops");
+        validate::validate(&dxil).expect("validate valu carry ops");
+        let dis = validate::disassemble(&dxil).expect("disasm valu carry ops");
+        assert!(!dis.contains("64-Bit integer"), "32-bit VALU carry ops must not require Int64Ops:\n{dis}");
+        assert!(!dis.contains("zext i32"), "32-bit VALU carry ops must not widen to i64:\n{dis}");
 
-        // Uniform s_barrier: every wave executes it -> Direct DXIL accepts & validates.
-        let uniform: Vec<u8> = [
-            ("S_BARRIER", "ENC_SOPP", &[][..], None),
-            ("S_ENDPGM", "ENC_SOPP", &[], None),
-        ]
-        .iter()
-        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
-        .collect();
-        let ku = translate_mesh(&uniform, o, &ms).expect("uniform MS barrier");
-        validate::validate(&ku.dxil).expect("uniform MS DXIL validate");
+        if !matches!(runner::wave32_supported(), Ok(true)) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        // Boundary triples (x, y, cin) covering overflow/underflow with and without carry/borrow-in.
+        let cases: [(u32, u32, bool); 32] = [
+            (0, 0, false),
+            (0, 0, true),
+            (0, 1, false),
+            (0, 1, true),
+            (1, 0, false),
+            (1, 0, true),
+            (1, 1, false),
+            (1, 1, true),
+            (u32::MAX, 0, false),
+            (u32::MAX, 0, true),
+            (u32::MAX, 1, false),
+            (u32::MAX, 1, true),
+            (0, u32::MAX, false),
+            (0, u32::MAX, true),
+            (u32::MAX, u32::MAX, false),
+            (u32::MAX, u32::MAX, true),
+            (u32::MAX - 1, 1, false),
+            (u32::MAX - 1, 1, true),
+            (0x7FFF_FFFF, 0x8000_0000, false),
+            (0x7FFF_FFFF, 0x8000_0000, true),
+            (0x8000_0000, 0x8000_0000, false),
+            (0x8000_0000, 0x8000_0000, true),
+            (0x8000_0000, 0x7FFF_FFFF, false),
+            (0x8000_0000, 0x7FFF_FFFF, true),
+            (2, 1, false),
+            (2, 1, true),
+            (1, 2, false),
+            (1, 2, true),
+            (0x1234_5678, 0xEDCB_A987, false),
+            (0x1234_5678, 0xEDCB_A987, true),
+            (0x1234_5678, 0xEDCB_A988, false),
+            (0x1234_5678, 0xEDCB_A988, true),
+        ];
+        let mut st = runner::KernelState::default();
+        let mut cin_mask = 0u32;
+        for (l, &(x, y, cin)) in cases.iter().enumerate() {
+            st.vgpr[l][0] = x;
+            st.vgpr[l][1] = y;
+            if cin {
+                cin_mask |= 1u32 << l;
+            }
+        }
+        st.sgpr[0] = cin_mask;
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run valu carry ops");
 
-        // Early-exit s_endpgm bypassing s_barrier in a multi-wave MS -> rejected so caller uses HLSL xcl_s_barrier().
-        let non_uniform: Vec<u8> = [
-            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 128)][..], None),
-            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),
-            ("S_BARRIER", "ENC_SOPP", &[], None),
-            ("S_ENDPGM", "ENC_SOPP", &[], None),
-        ]
-        .iter()
-        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
-        .collect();
-        let err = translate_mesh(&non_uniform, o, &ms).err().expect("non-uniform multi-wave MS barrier must fall back");
-        assert!(err.contains("non-uniform s_barrier"), "unexpected error: {err}");
+        let mut want_add_c = 0u32;
+        let mut want_sub_b = 0u32;
+        let mut want_subrev_b = 0u32;
+        for (l, &(x, y, cin)) in cases.iter().enumerate() {
+            let c = cin as u64;
+            let add64 = x as u64 + y as u64 + c;
+            assert_eq!(r.vgpr[l][2], add64 as u32, "add_co_ci lane {l} ({x:#x}, {y:#x}, {cin})");
+            if (add64 >> 32) != 0 {
+                want_add_c |= 1u32 << l;
+            }
+            let sub64 = (x as u64).wrapping_sub(y as u64).wrapping_sub(c);
+            assert_eq!(r.vgpr[l][3], sub64 as u32, "sub_co_ci lane {l} ({x:#x}, {y:#x}, {cin})");
+            if (sub64 >> 32) != 0 {
+                want_sub_b |= 1u32 << l;
+            }
+            let subrev64 = (y as u64).wrapping_sub(x as u64).wrapping_sub(c);
+            assert_eq!(r.vgpr[l][4], subrev64 as u32, "subrev_co_ci lane {l} ({x:#x}, {y:#x}, {cin})");
+            if (subrev64 >> 32) != 0 {
+                want_subrev_b |= 1u32 << l;
+            }
+        }
+        assert_eq!(r.sgpr[2], want_add_c, "add_co_ci carry-out mask");
+        assert_eq!(r.sgpr[4], want_sub_b, "sub_co_ci borrow-out mask");
+        assert_eq!(r.sgpr[6], want_subrev_b, "subrev_co_ci borrow-out mask");
     }
 }

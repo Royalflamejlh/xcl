@@ -12,41 +12,39 @@ Updated 2026-11-27.
 `main` `b49be18` with these pull requests merged, in this order, at these heads. #2477 (with #867) sits on `main` `f9a0cb80`,
 so its merge brings `main` up to `f9a0cb80`.
 `main` `753e8b1a` (2026-11-27, with #3057) is merged on top. Run its launch pass with `XCL_PREPARE_WORKERS=8` until #3085 is in a run here.
+`main` `e429936c` (2026-11-27, with #2959, #2872, #3085 and #3086) is merged on top of that. #2959 replaced the chained
+`ExecuteIndirect` of #2404 and #2633 and the allocator reclaim of #2707, so those three leave the table. A split
+program's `ExecuteIndirect` now runs its pieces only once its indirect set (pieces and whole form on the CBV root, built on
+one background thread) is ready; until then it runs the whole form, built on the title's thread (#2404 ran the pieces
+without it). #751's commit has been in `main` since #2844 (`fa671a2f`), so it leaves the table too.
 
 | Pull request | Head | What it does on Linux |
 |---|---|---|
 | #684 | `e56dbc3f` | fixes the #662 crash in `xg::copy_from` |
-| #751 | `59f8e7c9` | reads outside the coherent window |
 | #1599 | `5b1518fc` | DirectStorage requests failing at the world load |
 | #1860 | `bb2165b9` | dxil-spirv crashing on XCL's direct DXIL |
 | #2082 | `cab89ed5` | dxil-spirv writing SPIR-V `spirv-val` rejects |
-| #2404 | `5b9d4ff6` | split chained ExecuteIndirect (its newer head fixes the sweep #2707 replaces here) |
-| #2633 | `19be6590` | Dispatch-only signatures for those chains |
-| #2707 | `1a3b6981` | releases recordings in place of #2404's `free_aside` sweep (no device loss) |
 | #1803 | `cb007514` | heap addresses the world's shaders read |
 | #2229 | `98a629a3` | the constant data that left the world flat grey |
-| #1975 | `72960386` | (with the two above) the world in place of grey |
+| #1975 | `72960386` | (with the two above) the world in place of grey (its mesh barrier guard is left out: `main`'s wider one, 2ca91276, covers it) |
 | #2753 | `e07d03bf` | 3-D LUT pages: no white overexposure |
-| #2551 | `3567b2ef` | XCL's pipeline blob cache |
+| #2551 | `3567b2ef` | XCL's pipeline blob cache (the precompile builds every split program's whole form; `main` builds it only for those an earlier run used through `ExecuteIndirect`) |
 | #2070 | `d6bd4170` | 64 MB stacks for offline pipeline builds (a dxil-spirv stack overflow) |
 | #1368 | `92ef1316` | pipelines built with `NodeMask` 0, so vkd3d-proton takes the offline pass's blobs (#2453) |
 | #2762 | `496ef578` | one texture per view-by-address, not one per padding pattern (#2743) |
 | #2864 | `68cce725` | `XCL_DSTORAGE_CACHE`, an opt-in cache for DirectStorage reads |
 | #1479 | `70364190` | under Wine the final `report.json` is written at the title's exit (#1461) |
-| #2872 | `2dad32e6` | less DXC work per pixel shader (with #688) |
 | #688 | `760f742b` | a private heap per DXC compiler: the launch pass under Wine is no longer held on one shared heap |
 | (ours) `arch/window-title-commit` | `ad88ffc6` | the build's commit in XCL's window title, log and `report.json`; not a pull request yet |
 | #867 | `021b2c33` | keeps vkd3d-proton's native vtables and wraps the title's fences (#175) |
 | #2477 | `5225ddcb` | patches the assert-checked vtables in place under Wine (#175) |
 | #794 | `bee31d56` | hides the title's own 1920x1080 window, which Wine does not cloak (it showed white behind XCL's) |
 | #1462 | `813615c9` | the e2e title's cloak check accepts that hidden window |
-| #3085 | `651867a4` | the launch pass's worker count follows the memory left (#2705 for `main`): under Wine on 32 threads it ran 28 workers and went over 34 GB |
-| #3086 | `fdbac840` | the pass's verified compute blobs are kept when the worker count changes |
-| #3090 | `b3e67617` | keeps barriers carrying console hint flags (cherry-picked from its `nvidia-dev` branch; its test calls `runner::device`, which `main` lacks, so the tests do not compile here) |
+| #3090 | `b3e67617` | keeps barriers carrying console hint flags (cherry-picked from its `nvidia-dev` branch, with `nvidia-dev`'s `runner::device` for its test) |
 | #3091 | `64aa28f0` | derived pipelines keep the shared bytecode (cherry-picked from its `nvidia-dev` branch) |
-| #3092 | `d40a1540` | a 2 MiB grain for allocator page size two (cherry-picked from its `nvidia-dev` branch) |
+| #3092 | `d40a1540` | a 2 MiB grain for allocator page size two (cherry-picked from its `nvidia-dev` branch, with `nvidia-dev`'s `Uma::block_len` for its test) |
 
-Merge conflicts were resolved by keeping both sides; see each merge commit.
+Merge conflicts were resolved by keeping both sides, except where `main` already does what the pull request did; see each merge commit.
 
 ## vkd3d-proton
 

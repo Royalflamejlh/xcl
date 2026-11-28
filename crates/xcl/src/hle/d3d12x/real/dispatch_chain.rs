@@ -1,8 +1,10 @@
 //! PSOs for a split compute entry. The first piece is the real PSO returned
 //! to the caller. Other pieces and the lazily built whole form belong to it.
 use super::*;
+use super::super::used_journal::Journal;
 use crate::gpu::{dxil::kernel::DispatchChain, recomp::pso};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
 static PROGRAMS: AtomicU64 = AtomicU64::new(0);
 static PIECES: AtomicU64 = AtomicU64::new(0);
@@ -13,32 +15,69 @@ static SLABS: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
 static WANTED: AtomicU64 = AtomicU64::new(0);
-/// ExecuteIndirects run as chains, those of them that ran the whole form instead (more slabs than
-/// rounds), and the slabs lost when there was no whole form yet
-static INDIRECT: AtomicU64 = AtomicU64::new(0);
-static INDIRECT_WHOLE: AtomicU64 = AtomicU64::new(0);
-static INDIRECT_LOST: AtomicU64 = AtomicU64::new(0);
-/// ExecuteIndirects that ran the whole form (not chainable)
-static WHOLE_INDIRECT: AtomicU64 = AtomicU64::new(0);
-/// recordings made (`RECORDINGS`)
-static RECORDED: AtomicU64 = AtomicU64::new(0);
+
+struct IndirectUsed {
+    now: Journal,
+}
+
+static INDIRECT_USED: OnceLock<IndirectUsed> = OnceLock::new();
+static EARLIER_INDIRECT_USED: LazyLock<HashSet<u64>> = LazyLock::new(|| {
+    if cfg!(test) {
+        HashSet::new()
+    } else {
+        parse_used(&std::fs::read_to_string(indirect_used_path()).unwrap_or_default())
+    }
+});
+
+fn parse_used(text: &str) -> HashSet<u64> {
+    text.lines()
+        .filter_map(|line| u64::from_str_radix(line.trim(), 16).ok())
+        .filter(|&record| record != 0)
+        .collect()
+}
+
+fn indirect_used_path() -> std::path::PathBuf {
+    crate::gpu::recomp::dxc::cache_dir().join("used-indirect-split.txt")
+}
+
+fn indirect_used() -> &'static IndirectUsed {
+    INDIRECT_USED.get_or_init(|| {
+        if cfg!(test) {
+            return IndirectUsed { now: Journal::memory(HashSet::new()) };
+        }
+        let path = indirect_used_path();
+        let now = Journal::file(path, EARLIER_INDIRECT_USED.clone());
+        IndirectUsed { now }
+    })
+}
+
+fn note_indirect_use(chain: &Chain) {
+    if !chain.indirect_noted.swap(true, Ordering::Relaxed) {
+        indirect_used().now.note(chain.builder.record);
+    }
+}
+
+pub(crate) fn earlier_indirect_used() -> HashSet<u64> {
+    EARLIER_INDIRECT_USED.clone()
+}
+
+pub(crate) fn shutdown_indirect_used(timeout: std::time::Duration) {
+    if let Some(used) = INDIRECT_USED.get() {
+        let _ = used.now.shutdown_bounded(timeout);
+    }
+}
+
+pub(crate) fn flush_indirect_used(timeout: std::time::Duration) {
+    if let Some(used) = INDIRECT_USED.get() {
+        let _ = used.now.flush_bounded(timeout);
+    }
+}
 
 pub(crate) fn log_counts() {
     let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
-    let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
-    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab); ExecuteIndirect: {} chained ({} of them whole, {} slabs lost), {} whole",
-        n(&PROGRAMS), n(&PIECES), n(&DISPATCHES), n(&SLABS), mib(&LIVE), mib(&PEAK), mib(&WANTED),
-        n(&INDIRECT), n(&INDIRECT_WHOLE), n(&INDIRECT_LOST), n(&WHOLE_INDIRECT));
-    // what holds the recordings still kept: they go when their PC allocator is reset or, put aside, is free
-    let (keys, held) = {
-        let r = RECORDINGS.lock().unwrap();
-        let keys: Vec<(usize, usize)> = r.iter().map(|(&a, v)| (a, v.len())).collect();
-        let held = keys.iter().map(|&(_, n)| n).sum::<usize>();
-        (keys, held)
-    };
-    let [users, gpu, free, busy, idle, unknown] = super::super::alloc_pool::holds(&keys);
-    crate::xlog_info!("compute split: {held} of {} recordings held, under {} PC allocators: put aside with a list on it {users}, put aside with submits on the GPU {gpu}, put aside and free {free}; in use and busy {busy}, in use and free {idle}; not the pool's {unknown}",
-        n(&RECORDED), keys.len());
+    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab)",
+        PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed), SLABS.load(Ordering::Relaxed),
+        mib(&LIVE), mib(&PEAK), mib(&WANTED));
 }
 
 /// The scratch a dispatch uses at once, `XCL_SPLIT_SCRATCH_MB` (256): more groups than fit run in
@@ -53,132 +92,245 @@ struct PipelineBuilder {
     device: ID3D12Device,
     create: PsoFn,
     signature: ID3D12RootSignature,
-    /// its `pso::abi_signature_id`, which names the pieces' driver blobs (`driver_cache`)
-    chain: u64,
+    samplers: Vec<pso::StaticSampler>,
     flags: D3D12_PIPELINE_STATE_FLAGS,
     node: u32,
     record: u64,
+    mode: ComputeBuild,
 }
 
 impl PipelineBuilder {
-    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Option<ID3D12PipelineState> {
+    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Result<ID3D12PipelineState, HRESULT> {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
         let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
-            dxil, self.record, iid, &mut raw, ComputeBuild::Chain(self.chain));
-        (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
+            dxil, &self.samplers, self.record, iid, &mut raw, self.mode);
+        if hr >= 0 && !raw.is_null() { Ok(ID3D12PipelineState::from_raw(raw)) } else { Err(hr) }
     }
 }
+
+/// One exact chain's whole-form outcome. The owning `Chain` fixes device, DXIL, root signature,
+/// flags and node; releasing/recreating the pipeline gets a fresh outcome.
+pub(super) struct WholeBuild<T> {
+    result: OnceLock<Result<T, HRESULT>>,
+    retry_at: Mutex<Option<std::time::Instant>>,
+}
+
+impl<T: Clone> WholeBuild<T> {
+    pub(super) fn new() -> Self {
+        Self { result: OnceLock::new(), retry_at: Mutex::new(None) }
+    }
+
+    pub(super) fn get_or_build(&self, now: std::time::Instant, build: impl FnOnce() -> Result<T, HRESULT>) -> Result<T, HRESULT> {
+        if let Some(result) = self.result.get() {
+            return result.clone();
+        }
+        let mut retry_at = self.retry_at.lock().unwrap();
+        if let Some(result) = self.result.get() {
+            return result.clone();
+        }
+        if retry_at.is_some_and(|at| now < at) {
+            return Err(crate::util::E_OUTOFMEMORY);
+        }
+        match build() {
+            Err(hr) if hr == crate::util::E_OUTOFMEMORY => {
+                *retry_at = Some(now + WHOLE_RETRY);
+                Err(hr)
+            }
+            result => {
+                let _ = self.result.set(result.clone());
+                result
+            }
+        }
+    }
+
+    fn ready(&self) -> Option<Result<T, HRESULT>> {
+        self.result.get().cloned()
+    }
+}
+
+/// A transient whole-form OOM is retried after memory has had time to drain.
+const WHOLE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 struct Chain {
     builder: Arc<PipelineBuilder>,
     tail: Vec<ID3D12PipelineState>,
     words: u32,
     whole_code: Vec<u8>,
-    whole: OnceLock<ID3D12PipelineState>,
-    build_whole: Mutex<()>,
-    /// threads other than `want_whole`'s waiting for the whole form
-    waiting: std::sync::atomic::AtomicUsize,
-    /// the slabs of the last of its ExecuteIndirects read back, and whether one was read back yet
-    last: std::sync::atomic::AtomicU32,
-    measured: std::sync::atomic::AtomicBool,
-    /// its whole form was asked for in the background / a lost slab was reported
-    wanted: std::sync::atomic::AtomicBool,
-    warned: std::sync::atomic::AtomicBool,
+    whole: WholeBuild<ID3D12PipelineState>,
+    plan: Weak<DispatchChain>,
+    indirect: IndirectBuild,
+    indirect_noted: AtomicBool,
+}
+
+struct IndirectChain {
+    signature: ID3D12RootSignature,
+    whole: ID3D12PipelineState,
+    pieces: Vec<ID3D12PipelineState>,
+    _charge: IndirectCharge,
+}
+
+struct IndirectCharge(usize);
+
+impl Drop for IndirectCharge {
+    fn drop(&mut self) {
+        INDIRECT_VARIANT_SOURCE.fetch_sub(self.0, Ordering::AcqRel);
+    }
+}
+
+struct IndirectBuild {
+    requested: AtomicBool,
+    result: OnceLock<Result<Arc<IndirectChain>, HRESULT>>,
+}
+
+impl IndirectBuild {
+    fn new() -> Self {
+        Self { requested: AtomicBool::new(false), result: OnceLock::new() }
+    }
 }
 
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        // `want_whole`'s build may hold `build_whole` while it waits for its turn
-        // (`big_compile_turn`): while this thread waits, that build is one the title waits for
-        self.waiting.fetch_add(1, Ordering::AcqRel);
-        let built = self.build_whole_form();
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
-        built
+        self.whole
+            .get_or_build(std::time::Instant::now(), || self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)))
+            .map_err(|hr| if hr == crate::util::E_OUTOFMEMORY { "whole compute pipeline: out of memory".into() } else { format!("whole compute pipeline ({hr:#x})") })
     }
+}
 
-    unsafe fn build_whole_form(&self) -> Result<ID3D12PipelineState, String> {
-        let _guard = self.build_whole.lock().unwrap();
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
-        let _ = self.whole.set(p.clone());
-        Ok(p)
-    }
+static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
+/// Shared for the process lifetime so chains with a common piece also share its driver blob.
+static SIGNATURES: LazyLock<Mutex<HashMap<(usize, bool, Vec<u32>), ID3D12RootSignature>>> = LazyLock::new(Default::default);
 
-    /// The whole form built on another thread, for a later ExecuteIndirect with more slabs than rounds
-    fn want_whole(self: &Arc<Self>) {
-        if !self.wanted.swap(true, Ordering::Relaxed) {
-            let len = self.whole_code.len();
-            let lane = if len >= GIANT_DRIVER_COMPILE { 2 } else if len >= huge_pso_bytes() { 1 } else { 0 };
-            WHOLE_BUILDS[lane].push(Arc::downgrade(self), |chain| unsafe {
-                // (a program released before its turn is not built)
-                let Some(chain) = chain.upgrade() else { return };
-                let waited = chain.clone();
-                let built = super::super::pso_async::build_waited_on(move || waited.waiting.load(Ordering::Acquire) > 0, || {
-                    if chain.whole.get().is_some() { Ok(()) } else { chain.build_whole_form().map(drop) }
-                });
-                if let Err(e) = built { crate::xlog_warn!("D3D12.X: whole form of a split program: {e}"); }
-            });
+fn sampler_key(samplers: &[pso::StaticSampler]) -> Vec<u32> {
+    samplers.iter().flat_map(|(words, comparison)| words.iter().copied().chain([*comparison as u32])).collect()
+}
+
+const INDIRECT_PLAN_BYTES: usize = 64 << 20;
+const INDIRECT_VARIANT_BYTES: usize = 64 << 20;
+static INDIRECT_VARIANT_SOURCE: AtomicUsize = AtomicUsize::new(0);
+
+fn reserve_indirect_source(used: &AtomicUsize, bytes: usize, limit: usize) -> bool {
+    used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_add(bytes).filter(|&next| next <= limit)
+    }).is_ok()
+}
+
+#[derive(Default)]
+struct PlanCache {
+    bytes: usize,
+    plans: std::collections::VecDeque<(usize, Arc<DispatchChain>)>,
+}
+
+impl PlanCache {
+    fn insert(&mut self, plan: Arc<DispatchChain>, limit: usize) {
+        let key = Arc::as_ptr(&plan) as usize;
+        if let Some(at) = self.plans.iter().position(|p| p.0 == key) {
+            self.plans.remove(at);
+        } else {
+            self.bytes = self.bytes.saturating_add(plan.pieces.iter().map(Vec::capacity).sum::<usize>());
+        }
+        self.plans.push_back((key, plan));
+        while self.bytes > limit {
+            let Some((_, old)) = self.plans.pop_front() else { break };
+            self.bytes = self.bytes.saturating_sub(old.pieces.iter().map(Vec::capacity).sum::<usize>());
         }
     }
 }
 
-/// The thread of `want_whole`: an `xcl-pso*` one, so a huge whole form waits for its turn
-/// (`driver_compile`) as the workers' builds do
-fn whole_thread() -> std::thread::Builder {
-    std::thread::Builder::new().name("xcl-pso-chain-whole".into())
+fn retain_indirect_plan(plan: Arc<DispatchChain>) {
+    static PLANS: LazyLock<Mutex<PlanCache>> = LazyLock::new(Default::default);
+    PLANS.lock().unwrap().insert(plan, INDIRECT_PLAN_BYTES);
 }
 
-/// Work done one item after another on one thread of `whole_thread`'s, started when there is
-/// some and none is running.
-struct InTurn<T> {
-    queue: Mutex<(std::collections::VecDeque<T>, bool)>,
-    /// threads started so far
-    started: AtomicU64,
-}
-
-impl<T: Send + 'static> InTurn<T> {
-    const fn new() -> Self {
-        Self { queue: Mutex::new((std::collections::VecDeque::new(), false)), started: AtomicU64::new(0) }
+fn build_indirect(chain: &Arc<Chain>) -> Result<Arc<IndirectChain>, HRESULT> {
+    let plan = chain.plan.upgrade().ok_or(E_INVALIDARG)?;
+    let source_bytes = plan.pieces.iter().map(Vec::len).sum::<usize>().saturating_add(chain.whole_code.len());
+    if !reserve_indirect_source(&INDIRECT_VARIANT_SOURCE, source_bytes, INDIRECT_VARIANT_BYTES) {
+        return Err(E_OUTOFMEMORY);
     }
+    let charge = IndirectCharge(source_bytes);
+    let signature = unsafe { signature_for(&chain.builder.device, &chain.builder.samplers, true) }.ok_or(E_INVALIDARG)?;
+    let builder = Arc::new(PipelineBuilder {
+        device: chain.builder.device.clone(),
+        create: chain.builder.create,
+        signature: signature.clone(),
+        samplers: chain.builder.samplers.clone(),
+        flags: chain.builder.flags,
+        node: chain.builder.node,
+        record: chain.builder.record,
+        mode: ComputeBuild::IndirectChain,
+    });
+    // These variants are speculative: the ready direct whole form remains correct. Keep their
+    // cold driver compiles on this one low-impact lane instead of fanning out across PSO workers.
+    let mut pieces = Vec::with_capacity(plan.pieces.len());
+    for code in &plan.pieces {
+        pieces.push(unsafe { builder.pipeline(code, &pc_iid(Kind::PipelineState))? });
+    }
+    let whole = unsafe { builder.pipeline(&chain.whole_code, &pc_iid(Kind::PipelineState))? };
+    Ok(Arc::new(IndirectChain { signature, whole, pieces, _charge: charge }))
+}
 
-    fn push(&'static self, item: T, run: fn(T)) {
-        let mut q = self.queue.lock().unwrap();
-        q.0.push_back(item);
-        if std::mem::replace(&mut q.1, true) { return; }
-        drop(q);
-        self.started.fetch_add(1, Ordering::Relaxed);
-        let spawned = whole_thread().spawn(move || loop {
-            let next = {
-                let mut q = self.queue.lock().unwrap();
-                let next = q.0.pop_front();
-                q.1 = next.is_some();
-                next
-            };
-            match next { Some(item) => run(item), None => return }
-        });
-        // (the next push tries again)
-        if spawned.is_err() { self.queue.lock().unwrap().1 = false; }
+fn indirect_blobs_present(chain: &Chain, plan: &DispatchChain) -> bool {
+    plan.pieces.iter().map(Vec::as_slice).chain([chain.whole_code.as_slice()]).all(|dxil| {
+        super::driver_cache::path_for_chain_root_node(
+            dxil,
+            chain.builder.flags.0,
+            super::driver_cache::ChainRoot::IndirectCbv,
+            &chain.builder.samplers,
+            chain.builder.node,
+        )
+        .and_then(|path| std::fs::metadata(path).ok())
+        .is_some_and(|metadata| metadata.len() != 0)
+    })
+}
+
+fn request_indirect(chain: &Arc<Chain>) {
+    if chain.indirect.requested.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    static BUILDS: LazyLock<Option<std::sync::mpsc::Sender<Weak<Chain>>>> = LazyLock::new(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Weak<Chain>>();
+        std::thread::Builder::new().name("xcl-pso-chain-indirect".into()).stack_size(64 << 20).spawn(move || {
+            while let Ok(weak) = rx.recv() {
+                let Some(chain) = weak.upgrade() else { continue };
+                let result = build_indirect(&chain);
+                let _ = chain.indirect.result.set(result);
+            }
+        }).ok().map(|_| tx)
+    });
+    if BUILDS.as_ref().is_none_or(|queue| queue.send(Arc::downgrade(chain)).is_err()) {
+        chain.indirect.requested.store(false, Ordering::Release);
     }
 }
 
-/// The whole forms `want_whole` asked for, one lane for each slot set of `driver_compile` (small
-/// ones are never gated, huge and giant ones take their turns): a thread of their own for each
-/// would wait for its turn as well, and a title had 200 such threads, 199 of them waiting (#2404).
-static WHOLE_BUILDS: [InTurn<std::sync::Weak<Chain>>; 3] = [InTurn::new(), InTurn::new(), InTurn::new()];
-
-static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
+unsafe fn signature_for(dev: &ID3D12Device, samplers: &[pso::StaticSampler], indirect: bool) -> Option<ID3D12RootSignature> {
+    let key = (dev.as_raw() as usize, indirect, sampler_key(samplers));
+    if let Some(signature) = SIGNATURES.lock().unwrap().get(&key).cloned() {
+        return Some(signature);
+    }
+    let created = match if indirect {
+        pso::dispatch_chain_indirect_root_signature(dev, samplers)
+    } else {
+        pso::dispatch_chain_root_signature(dev, samplers)
+    } {
+        Ok(signature) => signature,
+        Err(e) => {
+            note_translation_error(format!("dispatch-chain root signature: {e}"));
+            return None;
+        }
+    };
+    Some(SIGNATURES.lock().unwrap().entry(key).or_insert(created).clone())
+}
 
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
     iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
     plan: Arc<DispatchChain>) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
-    let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
+    let signature = signature_for(dev, samplers, false)?;
     let rs = signature.as_raw() as usize;
-    let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature,
-        chain: pso::abi_signature_id(true, samplers), flags: desc.Flags, node: desc.NodeMask, record });
+    let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature, samplers: samplers.to_vec(),
+        flags: desc.Flags, node: desc.NodeMask, record, mode: ComputeBuild::DirectChain });
     let jobs = (0..plan.pieces.len()).map(|i| {
         let plan = plan.clone();
         let builder = builder.clone();
@@ -191,8 +343,14 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), waiting: Default::default(),
-        last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
+        whole_code: whole.to_vec(), whole: WholeBuild::new(), plan: Arc::downgrade(&plan),
+        indirect: IndirectBuild::new(), indirect_noted: AtomicBool::new(false) });
+    retain_indirect_plan(plan.clone());
+    // Initialize the journal on this preparation worker, never on the first recording call.
+    let _ = indirect_used();
+    if EARLIER_INDIRECT_USED.contains(&record) && indirect_blobs_present(&chain, &plan) {
+        request_indirect(&chain);
+    }
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -207,7 +365,6 @@ pub(super) fn forget(pso: usize) {
 
 pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    if chain.is_some() { WHOLE_INDIRECT.fetch_add(1, Ordering::Relaxed); }
     chain.map(|c| c.whole()).transpose()
 }
 
@@ -224,64 +381,53 @@ impl Drop for Scratch {
 
 struct Recording {
     scratch: Arc<Scratch>,
+    /// Keep the title-visible direct first piece alive while this recording may still execute.
+    /// Indirect execution uses its separate CBV-compatible duplicates.
     first: ID3D12PipelineState,
     chain: Arc<Chain>,
-    indirect: Option<Indirect>,
-}
-
-/// The commands of a chained ExecuteIndirect (`pso::record_slicer`), read when the GPU is done
-/// with them (the allocator is reset): with more slabs than rounds, the next ExecuteIndirect of
-/// the program records more, and the whole form is built for it
-struct Indirect {
-    commands: ID3D12Resource,
-    at: u64,
-    rounds: u32,
-    /// the whole form ran instead (the slicer gave it the arguments); `checked`: the chain was
-    /// recorded and the title's predication was not set (it may skip the slicer, whose words are
-    /// then no count)
-    whole: bool,
-    checked: bool,
-}
-
-impl Recording {
-    fn read_back(&self) {
-        let Some(i) = self.indirect.as_ref().filter(|i| i.checked) else { return };
-        let mut p = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: i.at as usize, End: i.at as usize + 16 };
-        if unsafe { i.commands.Map(0, Some(&range), Some(&mut p)) }.is_err() { return; }
-        let [partial, _, slabs, _] = unsafe { std::ptr::read_volatile((p as *const u8).add(i.at as usize) as *const [u32; 4]) };
-        unsafe { i.commands.Unmap(0, Some(&D3D12_RANGE::default())) };
-        self.chain.last.store(slabs, Ordering::Relaxed);
-        self.chain.measured.store(true, Ordering::Relaxed);
-        if partial == 0 { return; }
-        if i.whole {
-            INDIRECT_WHOLE.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        INDIRECT_LOST.fetch_add(u64::from(slabs.saturating_sub(i.rounds)), Ordering::Relaxed);
-        if !self.chain.warned.swap(true, Ordering::Relaxed) {
-            crate::xlog_warn!("D3D12.X: ExecuteIndirect of a split program ({:#x}) had {slabs} slabs for {} rounds: {} lost; its whole form is built for the next ones",
-                self.first.as_raw() as usize, i.rounds, slabs - i.rounds);
-        }
-        self.chain.want_whole();
-    }
-}
-
-impl Drop for Recording {
-    fn drop(&mut self) {
-        self.read_back();
-    }
+    _indirect_commands: Option<Arc<CommandStorage>>,
 }
 
 static RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Recording>>>>> = LazyLock::new(Default::default);
 /// list → the allocator it records on and the scratch its chains share: they are dispatched one
 /// after another, with a barrier between them (the recordings keep it alive)
 static SHARED: LazyLock<Mutex<HashMap<usize, (usize, std::sync::Weak<Scratch>)>>> = LazyLock::new(Default::default);
+/// One recording list reuses indirect commands at offset zero. Buffer state transitions are
+/// resource-wide, so storage is deliberately never shared across lists.
+static COMMANDS: LazyLock<Mutex<HashMap<usize, (usize, Weak<CommandStorage>)>>> = LazyLock::new(Default::default);
 
-/// `list` begins another recording, which the GPU may run beside the last one: a Reset, or a
-/// list created at the address of a released one (#2588). Also when it is released.
+struct CommandStorage {
+    buffer: ID3D12Resource,
+    bytes: u64,
+}
+
+const COMMAND_STORAGE_BYTES: u64 = 64 << 10;
+
+fn command_storage_bytes(bytes: u64) -> u64 {
+    bytes.max(COMMAND_STORAGE_BYTES).next_multiple_of(COMMAND_STORAGE_BYTES)
+}
+
+unsafe fn commands_for(
+    dev: &ID3D12Device, list: usize, allocator: usize, bytes: u64,
+) -> Option<Arc<CommandStorage>> {
+    {
+        let commands = COMMANDS.lock().unwrap();
+        if let Some((_, storage)) = commands.get(&list).filter(|entry| entry.0 == allocator) {
+            if let Some(storage) = storage.upgrade().filter(|storage| storage.bytes >= bytes) {
+                return Some(storage);
+            }
+        }
+    }
+    let size = command_storage_bytes(bytes);
+    let storage = Arc::new(CommandStorage { buffer: pso::chain_commands_storage(dev, size)?, bytes: size });
+    COMMANDS.lock().unwrap().insert(list, (allocator, Arc::downgrade(&storage)));
+    Some(storage)
+}
+
+/// `list` begins another recording, which the GPU may run beside the last one.
 pub(in crate::hle::d3d12x) fn list_reset(list: usize) {
     SHARED.lock().unwrap().remove(&list);
+    COMMANDS.lock().unwrap().remove(&list);
 }
 
 /// `to` records right after `from` on the same allocator: its chains go on in `from`'s scratch.
@@ -290,16 +436,6 @@ pub(in crate::hle::d3d12x) fn list_follows(from: usize, to: usize) {
     if let Some(e) = shared.get(&from).cloned() {
         shared.insert(to, e);
     }
-}
-
-#[cfg(test)]
-pub(in crate::hle::d3d12x) fn note_shared_for_test(list: usize, allocator: usize) {
-    SHARED.lock().unwrap().insert(list, (allocator, std::sync::Weak::new()));
-}
-
-#[cfg(test)]
-pub(in crate::hle::d3d12x) fn shares_scratch_for_test(list: usize) -> bool {
-    SHARED.lock().unwrap().contains_key(&list)
 }
 
 /// The scratch of all recordings alive together, `XCL_SPLIT_SCRATCH_TOTAL_MB` (384). A recording
@@ -343,88 +479,6 @@ unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed:
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
     let recordings = RECORDINGS.lock().unwrap().remove(&allocator);
     drop(recordings);
-    let constants = CONSTANTS.lock().unwrap().remove(&allocator);
-    if let Some((blocks, _)) = constants {
-        let gone = keep_free_constants(&mut FREE_CONSTANTS.lock().unwrap(), blocks);
-        drop(gone); // (outside the lock)
-    }
-}
-
-/// The blocks of `Constants` kept for use again: those of `CONSTANTS_BLOCK` bytes, up to
-/// `FREE_CONSTANTS_BYTES` of them; the others are returned to be released. Without a bound a
-/// burst of big slab constants stayed mapped for the rest of the process.
-fn keep_free_constants(free: &mut Vec<Constants>, blocks: Vec<Constants>) -> Vec<Constants> {
-    let mut kept: u64 = free.iter().map(|b| b.bytes).sum();
-    let mut gone = Vec::new();
-    for b in blocks {
-        if b.bytes == CONSTANTS_BLOCK && kept + b.bytes <= FREE_CONSTANTS_BYTES {
-            kept += b.bytes;
-            free.push(b);
-        } else {
-            gone.push(b);
-        }
-    }
-    gone
-}
-
-/// Memory the CPU writes the slabs' constants of direct dispatches in (`pso::record_dispatch_chain`):
-/// an allocator's recordings use a block of it until the allocator is reset, then other ones do.
-struct Constants {
-    buffer: ID3D12Resource,
-    device: usize,
-    cpu: usize,
-    bytes: u64,
-}
-
-/// allocator → its blocks and the bytes used of the last one
-static CONSTANTS: LazyLock<Mutex<HashMap<usize, (Vec<Constants>, u64)>>> = LazyLock::new(Default::default);
-static FREE_CONSTANTS: Mutex<Vec<Constants>> = Mutex::new(Vec::new());
-const CONSTANTS_BLOCK: u64 = 64 << 10;
-/// the most bytes of blocks kept for use again (`keep_free_constants`)
-const FREE_CONSTANTS_BYTES: u64 = 8 << 20;
-
-/// `bytes` of `Constants` for a dispatch recorded with `allocator`: their CPU and GPU addresses.
-unsafe fn constants_for(dev: &ID3D12Device, allocator: usize, bytes: u64) -> Option<(*mut u8, u64)> {
-    let mut all = CONSTANTS.lock().unwrap();
-    let (blocks, used) = all.entry(allocator).or_default();
-    if blocks.last().is_none_or(|b| *used + bytes > b.bytes) {
-        let device = dev.as_raw() as usize;
-        let free = {
-            let mut f = FREE_CONSTANTS.lock().unwrap();
-            f.iter().position(|b| b.device == device && b.bytes >= bytes).map(|k| f.swap_remove(k))
-        };
-        blocks.push(match free { Some(b) => b, None => constants_block(dev, bytes.max(CONSTANTS_BLOCK))? });
-        *used = 0;
-    }
-    let b = blocks.last()?;
-    let at = *used;
-    *used += bytes;
-    Some(((b.cpu as *mut u8).add(at as usize), b.buffer.GetGPUVirtualAddress() + at))
-}
-
-unsafe fn constants_block(dev: &ID3D12Device, bytes: u64) -> Option<Constants> {
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
-        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
-    };
-    let mut resource: Option<ID3D12Resource> = None;
-    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, CreationNodeMask: 1, VisibleNodeMask: 1, ..Default::default() },
-        D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut resource).ok()?;
-    let buffer = resource?;
-    let mut cpu = std::ptr::null_mut();
-    buffer.Map(0, Some(&D3D12_RANGE::default()), Some(&mut cpu)).ok()?;
-    Some(Constants { buffer, device: dev.as_raw() as usize, cpu: cpu as usize, bytes })
-}
-
-#[cfg(test)]
-pub(in crate::hle::d3d12x) fn note_recordings_for_test(allocator: usize) {
-    RECORDINGS.lock().unwrap().entry(allocator).or_default();
-}
-
-#[cfg(test)]
-pub(in crate::hle::d3d12x) fn holds_recordings_for_test(allocator: usize) -> bool {
-    RECORDINGS.lock().unwrap().contains_key(&allocator)
 }
 
 unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resource> {
@@ -439,13 +493,44 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
     resource
 }
 
+fn remapped_grid(mut grid: [u32; 3], remap: Option<(u32, u32)>) -> Option<[u32; 3]> {
+    if grid.into_iter().any(|n| n > 65_535) {
+        return None;
+    }
+    if let Some((ratio, dim)) = remap {
+        let count = grid.get_mut(dim as usize)?;
+        let scaled = count.checked_mul(ratio)?;
+        // D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION (an SDK macro, not in windows-rs).
+        if scaled > 65_535 {
+            return None;
+        }
+        *count = scaled;
+    }
+    Some(grid)
+}
+
 /// Called with the original six ABI views bound. The extended signature is
 /// common to every piece and the whole fallback. Choose before recording any
 /// part of the dispatch, including when scratch allocation fails.
-pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, grid: [u32; 3]) -> Result<(), String> {
+pub(in crate::hle::d3d12x) unsafe fn dispatch(
+    list: &ID3D12GraphicsCommandList, original: usize, pso: usize, allocator: usize, grid: [u32; 3],
+) -> Result<(), String> {
+    if grid.into_iter().any(|n| n > 65_535) {
+        return Err("dispatch group count exceeds 65535 on one axis".into());
+    }
     let [x, y, z] = grid;
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    let Some(chain) = chain else { list.Dispatch(x, y, z); return Ok(()) };
+    let Some(chain) = chain else {
+        match remapped_grid(grid, super::pso_dispatch_remap_exact(pso)) {
+            Some([x, y, z]) => list.Dispatch(x, y, z),
+            None => {
+                let whole = super::remap_fallback::whole_exact(pso)?;
+                super::bind_pipeline_exact(list.as_raw(), original, whole.as_raw() as usize);
+                list.Dispatch(x, y, z);
+            }
+        }
+        return Ok(())
+    };
     if grid.contains(&0) { return Ok(()); }
     // A title Reset can switch to a different PC allocator while this
     // recording is still submitted on the old one. Retain by backing.
@@ -459,111 +544,208 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
         .then(|| scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, needed, group)).flatten();
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
-    let constants = scratch.as_ref()
-        .and_then(|_| constants_for(&chain.builder.device, allocator, slabs.len() as u64 * u64::from(pso::CHAIN_COMMAND_BYTES)));
-    let (Some((scratch, used)), Some(constants)) = (scratch, constants) else {
-        list.SetPipelineState(&chain.whole()?);
+    let Some((scratch, used)) = scratch else {
+        let whole = chain.whole()?;
+        super::bind_pipeline_exact(list.as_raw(), original, whole.as_raw() as usize);
         list.Dispatch(x, y, z);
         return Ok(());
     };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
-    let held = Arc::new(Recording { scratch, first, chain, indirect: None });
-    RECORDED.fetch_add(1, Ordering::Relaxed);
+    let held = Arc::new(Recording { scratch, first, chain, _indirect_commands: None });
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
-    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, constants, std::iter::once(&held.first).chain(&held.chain.tail));
+    pso::record_dispatch_chain(
+        list, grid, most, &held.scratch.buffer, used,
+        std::iter::once(&held.first).chain(&held.chain.tail),
+        |piece| super::bind_pipeline_exact(list.as_raw(), original, piece.as_raw() as usize),
+    );
     Ok(())
 }
 
-/// The rounds a chained ExecuteIndirect records at most, `XCL_SPLIT_INDIRECT_ROUNDS` (32): each
-/// is one ExecuteIndirect and one barrier per piece, also when the title's arguments leave it empty.
-fn most_rounds() -> u32 {
-    static B: OnceLock<u32> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("XCL_SPLIT_INDIRECT_ROUNDS").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(32u32).min(1024))
+fn indirect_rounds() -> u32 {
+    static ROUNDS: OnceLock<u32> = OnceLock::new();
+    *ROUNDS.get_or_init(|| std::env::var("XCL_SPLIT_INDIRECT_ROUNDS").ok().and_then(|v| v.trim().parse().ok())
+        .filter(|&n| n > 0).unwrap_or(16u32).min(1024))
 }
 
-/// The rounds for slabs of `most` groups: as many as the arguments there now (`seen`, the GPU's
-/// last ones) or an earlier ExecuteIndirect of the program (`before`) had, a quarter more, at
-/// least two and at most `cap`. Before one was read back (`before` None), `cap`: the arguments
-/// seen when recording can be 0 while the GPU's are not (a title's first ones had 17 slabs).
-fn indirect_rounds(seen: &[[u32; 3]], most: u64, before: Option<u32>, cap: u32) -> u32 {
-    let Some(before) = before else { return cap.max(2) };
-    let now: u64 = seen.iter().map(|&g| pso::slab_count(g, most)).sum();
-    let want = now.max(u64::from(before));
-    (want + want.div_ceil(4)).clamp(2, u64::from(cap.max(2))) as u32
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndirectReadiness {
+    Run,
+    Request,
+    Fallback,
+    Fail(HRESULT),
 }
 
-/// The slabs of an earlier ExecuteIndirect of the program for `indirect_rounds`: None (the most
-/// rounds) until one was read back and its whole form is built, as slabs past the rounds are
-/// lost until then (one program's first ExecuteIndirects had a slab, a later one 22, #2404). Then
-/// the last one's, as more run the whole form: every round costs its pieces' ExecuteIndirects,
-/// also when empty (each ~0.4 us of GPU after its barrier on an RTX 5070 Ti, #2404).
-fn slabs_before(measured: bool, whole: bool, last: u32) -> Option<u32> {
-    (measured && whole).then_some(last)
-}
-
-/// An ExecuteIndirect of split program `pso` whose command signature is one Dispatch of `stride`
-/// bytes: `commands` of them at GPU address `args` (their count at `count`, when given), run as
-/// the chain. `seen`: the arguments the CPU sees there now. `bind` binds the ABI after the
-/// slicer. The whole form (built already) runs instead when the arguments have more slabs than
-/// the rounds, also under the title's predication (`predicated`, which then holds for the slicer
-/// too).
-/// Ok(false): nothing recorded (no chain, a bundle, no scratch) – the caller runs the whole form.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, args: u64, stride: u32,
-    commands: u32, count: Option<u64>, seen: &[[u32; 3]], predicated: bool, bind: impl FnOnce() -> Result<(), String>) -> Result<bool, String> {
-    let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    let Some(chain) = chain else { return Ok(false) };
-    if list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE { return Ok(false); }
-    // kept with the PC allocator the list records on, also for a list the pool has not seen (#2333
-    // keeps such a list's with the title's allocator: the pool knew nothing of the list, and could
-    // take that allocator for free while the list still recorded or ran on the GPU)
-    let allocator = super::super::alloc_pool::recording_backing_or_take_on(list.as_raw() as usize, allocator, list.GetType().0);
-    if allocator == 0 { return Ok(false); }
-    let dev = &chain.builder.device;
-    let group = u64::from(chain.words) * 4;
-    let Some((scratch, _)) = scratch_for(dev, list.as_raw() as usize, allocator, scratch_budget(), group) else { return Ok(false) };
-    let most = (scratch.bytes / group).max(1);
-    let sig = pso::dispatch_command_signature(dev)?;
-    let full = chain.whole.get().cloned();
-    let before = slabs_before(chain.measured.load(Ordering::Relaxed), full.is_some(), chain.last.load(Ordering::Relaxed));
-    let rounds = indirect_rounds(seen, most, before, most_rounds());
-    let buffer = pso::chain_commands_buffer(dev, rounds, commands).ok_or("no buffer for the commands of a chained ExecuteIndirect")?;
-    // not built: asked for now, so that it is there before an ExecuteIndirect of the program
-    // needs more slabs than its rounds (until then those are lost)
-    if full.is_none() {
-        chain.want_whole();
+fn indirect_readiness(
+    whole: Option<Result<(), HRESULT>>,
+    indirect: Option<Result<(), HRESULT>>,
+) -> IndirectReadiness {
+    match (whole, indirect) {
+        (_, Some(Ok(()))) => IndirectReadiness::Run,
+        (Some(Err(hr)), _) => IndirectReadiness::Fail(hr),
+        (Some(Ok(())), None) => IndirectReadiness::Request,
+        _ => IndirectReadiness::Fallback,
     }
-    let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
-    pso::record_slicer(list, args, stride, commands, count, rounds, most, full.is_some(), &buffer)?;
-    // the list uses `buffer` from here: the recording keeps it until the allocator is reset, also
-    // when binding fails and nothing more is recorded
-    let bound = bind();
-    let at = pso::chain_tail_offset(rounds);
-    if bound.is_ok() {
-        // the slicer left either these arguments or the rounds empty. The whole form goes first
-        // (each round's pieces start after a UAV barrier), with nothing of the chain before it:
-        // after the pieces' ExecuteIndirects it did not run right on an RTX 3080 Ti (#2404)
-        if let Some(full) = &full {
-            list.SetPipelineState(full);
-            list.ExecuteIndirect(&sig, commands, &buffer, at + 16, None::<&ID3D12Resource>, 0);
+}
+
+/// Run one Dispatch-only indirect command through an existing split chain. A complete indirect
+/// set is independent of the direct whole-form build. Otherwise preserve the synchronous fallback;
+/// the slicer writes either bounded piece commands or the whole-form command, never a partial chain.
+pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
+    list: &ID3D12GraphicsCommandList, original: usize, pso: usize, allocator: usize, args: u64,
+    bind: impl FnOnce(usize) -> Result<(), String>,
+) -> Result<bool, String> {
+    let Some(chain) = CHAINS.lock().unwrap().get(&pso).cloned() else { return Ok(false) };
+    note_indirect_use(&chain);
+    let whole = chain.whole.ready().map(|result| result.map(|_| ()));
+    let indirect = chain.indirect.result.get().map(|result| match result {
+        Ok(_) => Ok(()),
+        Err(hr) => Err(*hr),
+    });
+    match indirect_readiness(whole, indirect) {
+        IndirectReadiness::Run => {}
+        IndirectReadiness::Request => {
+            request_indirect(&chain);
+            return Ok(false);
         }
-        pso::record_dispatch_chain_indirect(list, &sig, &buffer, rounds, &scratch.buffer, std::iter::once(&first).chain(&chain.tail));
+        IndirectReadiness::Fallback => return Ok(false),
+        IndirectReadiness::Fail(hr) => return Err(format!("whole compute pipeline ({hr:#x})")),
+    };
+    let Some(Ok(indirect)) = chain.indirect.result.get() else { unreachable!() };
+    let indirect = indirect.clone();
+    let allocator = if super::super::alloc_pool::enabled() {
+        super::super::alloc_pool::recording_backing(list.as_raw() as usize).unwrap_or(0)
+    } else { allocator };
+    if allocator == 0 || list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE { return Ok(false); }
+    let group = u64::from(chain.words) * 4;
+    let Some((scratch, _)) = scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, scratch_budget(), group) else {
+        return Ok(false);
+    };
+    let signature = pso::dispatch_command_signature(&chain.builder.device)?;
+    let rounds = indirect_rounds();
+    let command_bytes = pso::chain_tail_offset(rounds) + 12;
+    let commands = commands_for(
+        &chain.builder.device, list.as_raw() as usize, allocator, command_bytes,
+    ).ok_or("no command buffer for split ExecuteIndirect")?;
+    let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
+    pso::record_indirect_slicer(
+        list, args, rounds, (scratch.bytes / group).max(1), &commands.buffer,
+        |slicer| super::bind_pipeline_exact(list.as_raw(), original, slicer.as_raw() as usize),
+    )?;
+    let bound = bind(indirect.signature.as_raw() as usize);
+    if bound.is_ok() {
+        super::bind_pipeline_exact(list.as_raw(), original, indirect.whole.as_raw() as usize);
+        list.ExecuteIndirect(&signature, 1, &commands.buffer,
+            pso::chain_tail_offset(rounds), None::<&ID3D12Resource>, 0);
+        pso::record_dispatch_chain_indirect(
+            list, &signature, &commands.buffer, rounds, &scratch.buffer, indirect.pieces.iter(),
+            |piece| super::bind_pipeline_exact(list.as_raw(), original, piece.as_raw() as usize),
+        );
     }
-    let indirect = Indirect { commands: buffer, at, rounds, whole: full.is_some(), checked: bound.is_ok() && !predicated };
-    RECORDED.fetch_add(1, Ordering::Relaxed);
-    RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording { scratch, first, chain, indirect: Some(indirect) }));
+    pso::restore_indirect_commands(list, &commands.buffer);
+    RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording {
+        scratch, first, chain, _indirect_commands: Some(commands),
+    }));
     bound?;
-    INDIRECT.fetch_add(1, Ordering::Relaxed);
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_bytes, LEAST};
+    use super::*;
+
+    #[test]
+    fn indirect_used_records_parse_unique_nonzero_hex() {
+        assert_eq!(parse_used("1\n0000000000000002\ninvalid\n0\n1\n"), [1, 2].into());
+    }
+
+    #[test]
+    fn ready_indirect_set_does_not_wait_for_direct_whole() {
+        assert_eq!(indirect_readiness(None, Some(Ok(()))), IndirectReadiness::Run);
+        assert_eq!(
+            indirect_readiness(Some(Err(E_INVALIDARG)), Some(Ok(()))),
+            IndirectReadiness::Run,
+        );
+        assert_eq!(indirect_readiness(Some(Ok(())), None), IndirectReadiness::Request);
+        assert_eq!(indirect_readiness(None, None), IndirectReadiness::Fallback);
+        assert_eq!(
+            indirect_readiness(Some(Ok(())), Some(Err(E_INVALIDARG))),
+            IndirectReadiness::Fallback,
+        );
+        assert_eq!(
+            indirect_readiness(Some(Err(E_INVALIDARG)), Some(Err(E_OUTOFMEMORY))),
+            IndirectReadiness::Fail(E_INVALIDARG),
+        );
+    }
 
     const MB: u64 = 1 << 20;
+
+    #[test]
+    fn indirect_command_storage_covers_the_fixed_recording_at_64k_granularity() {
+        assert_eq!(command_storage_bytes(12), 64 << 10);
+        assert_eq!(command_storage_bytes((64 << 10) + 1), 128 << 10);
+        assert!(command_storage_bytes(pso::chain_tail_offset(1024) + 12)
+            >= pso::chain_tail_offset(1024) + 12);
+    }
+
+    #[test]
+    fn retained_indirect_plans_are_deduplicated_and_bounded() {
+        let plan = |byte: u8| Arc::new(DispatchChain {
+            pieces: vec![vec![byte; 40], vec![byte; 40]],
+            dwords_per_group: 4,
+        });
+        let (first, second) = (plan(1), plan(2));
+        let first_weak = Arc::downgrade(&first);
+        let mut cache = PlanCache::default();
+        cache.insert(first.clone(), 100);
+        cache.insert(first, 100);
+        assert_eq!((cache.plans.len(), cache.bytes), (1, 80));
+        cache.insert(second, 100);
+        assert_eq!((cache.plans.len(), cache.bytes), (1, 80));
+        assert!(first_weak.upgrade().is_none(), "the oldest plan was released at the cap");
+    }
+
+    #[test]
+    fn indirect_variant_source_admission_never_exceeds_its_cap() {
+        let used = AtomicUsize::new(0);
+        assert!(reserve_indirect_source(&used, 60, 100));
+        assert!(!reserve_indirect_source(&used, 41, 100));
+        assert_eq!(used.load(Ordering::Relaxed), 60);
+        assert!(reserve_indirect_source(&used, 40, 100));
+        assert_eq!(used.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn signature_identity_includes_sampler_words_order_and_comparison() {
+        let a = ([1, 2, 3, 4], false);
+        let b = ([5, 6, 7, 8], true);
+        assert_eq!(sampler_key(&[a, b]), sampler_key(&[a, b]));
+        assert_ne!(sampler_key(&[a, b]), sampler_key(&[b, a]));
+        assert_ne!(sampler_key(&[a]), sampler_key(&[([1, 2, 3, 4], true)]));
+    }
+
+    #[test]
+    fn remapped_grid_scales_only_its_dimension_and_refuses_overflow() {
+        assert_eq!(remapped_grid([3, 5, 7], Some((4, 1))), Some([3, 20, 7]));
+        assert_eq!(remapped_grid([3, 5, 7], None), Some([3, 5, 7]));
+        assert_eq!(remapped_grid([65_535, 1, 1], None), Some([65_535, 1, 1]));
+        assert_eq!(remapped_grid([65_536, 1, 1], None), None);
+        assert_eq!(remapped_grid([1, 65_536, 1], None), None);
+        assert_eq!(remapped_grid([1, 1, 65_536], None), None);
+        assert_eq!(remapped_grid([32_768, 1, 1], Some((2, 0))), None);
+        assert_eq!(remapped_grid([u32::MAX, 1, 1], Some((2, 0))), None);
+        assert_eq!(remapped_grid([1, 1, 1], Some((2, 3))), None);
+    }
+
+    #[test]
+    fn released_pipeline_does_not_lend_its_remap_to_address_reuse() {
+        let pso = 0x7E57_6400usize;
+        super::super::note_pso_dispatch_remap(pso as *mut c_void, Some((4, 0)));
+        assert_eq!(super::super::pso_dispatch_remap(pso), Some((4, 0)));
+        super::super::forget_pso_for_test(pso);
+        assert_eq!(super::super::pso_dispatch_remap(pso), None);
+    }
 
     #[test]
     fn a_list_recorded_after_another_goes_on_in_its_scratch() {
@@ -612,213 +794,95 @@ mod tests {
     }
 
     #[test]
-    fn a_programs_first_execute_indirect_gets_the_most_rounds() {
-        use super::indirect_rounds;
-        // none read back yet: the arguments seen when recording (0 while a title loads) don't count
-        assert_eq!(indirect_rounds(&[[0, 0, 0]], 8, None, 32), 32);
-        assert_eq!(indirect_rounds(&[[2, 3, 2]], 1, None, 32), 32);
-        assert_eq!(indirect_rounds(&[], 1, None, 1), 2);
-        // then the slabs seen or read back, a quarter more, 2 to the cap
-        assert_eq!(indirect_rounds(&[[0, 0, 0]], 8, Some(0), 32), 2);
-        assert_eq!(indirect_rounds(&[[2, 3, 2]], 1, Some(0), 32), 15);
-        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, Some(17), 32), 22);
-        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, Some(40), 32), 32);
+    fn a_non_oom_whole_failure_is_final_only_for_that_chain() {
+        let at = std::time::Instant::now();
+        let whole: WholeBuild<u32> = WholeBuild::new();
+        let mut calls = 0;
+        assert_eq!(whole.get_or_build(at, || { calls += 1; Err(crate::util::E_FAIL) }), Err(crate::util::E_FAIL));
+        assert_eq!(whole.get_or_build(at + WHOLE_RETRY, || { calls += 1; Ok(7) }), Err(crate::util::E_FAIL));
+        assert_eq!(calls, 1, "the same immutable chain does not repeat a deterministic driver failure");
+
+        let rebuilt: WholeBuild<u32> = WholeBuild::new();
+        assert_eq!(rebuilt.get_or_build(at, || Ok(7)), Ok(7), "a new chain after policy/cache changes still builds");
     }
 
     #[test]
-    fn once_the_whole_form_is_built_the_last_execute_indirect_sizes_the_rounds() {
-        use super::{indirect_rounds, slabs_before};
-        assert_eq!(slabs_before(false, true, 1), None);
-        // not built: the most rounds, also after one of a slab was read back (a later one can
-        // have 22, whose slabs past the rounds would be lost)
-        assert_eq!(slabs_before(true, false, 1), None);
-        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, false, 1), 32), 32);
-        // built: the last one's, an overflow runs the whole form
-        assert_eq!(slabs_before(true, true, 1), Some(1));
-        assert_eq!(indirect_rounds(&[[0, 0, 0]], 1, slabs_before(true, true, 1), 32), 2);
-        assert_eq!(indirect_rounds(&[[3, 1, 1]], 1, slabs_before(true, true, 1), 32), 4);
+    fn a_whole_oom_is_throttled_then_retried() {
+        let at = std::time::Instant::now();
+        let whole: WholeBuild<u32> = WholeBuild::new();
+        let mut calls = 0;
+        assert_eq!(whole.get_or_build(at, || { calls += 1; Err(crate::util::E_OUTOFMEMORY) }), Err(crate::util::E_OUTOFMEMORY));
+        assert_eq!(whole.get_or_build(at + WHOLE_RETRY / 2, || { calls += 1; Ok(7) }), Err(crate::util::E_OUTOFMEMORY));
+        assert_eq!(calls, 1, "calls during the cooldown do not enter the driver");
+        assert_eq!(whole.get_or_build(at + WHOLE_RETRY, || { calls += 1; Ok(7) }), Ok(7));
+        assert_eq!(whole.get_or_build(at + WHOLE_RETRY * 2, || { calls += 1; Ok(8) }), Ok(7));
+        assert_eq!(calls, 2, "the successful retry is retained");
     }
 
     #[test]
-    fn the_whole_form_built_in_the_background_waits_for_a_huge_compiles_turn() {
-        use super::super::{big_compile_turn, driver_compile, huge_pso_bytes, huge_pso_concurrency, BIG_COMPILES, GIANT_COMPILES};
-        // every slot taken: a huge compile on `want_whole`'s thread waits for one
-        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
-        held.push(big_compile_turn(&GIANT_COMPILES, || true, || false));
-        let t = super::whole_thread().spawn(|| driver_compile("test", huge_pso_bytes(), true, || 7)).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(!t.is_finished(), "a huge compile on the whole form's thread did not wait for a slot");
-        drop(held);
-        assert_eq!(t.join().unwrap(), 7);
-    }
-
-    #[test]
-    fn direct_dispatches_write_their_constants_in_blocks_used_again_after_the_allocator_reset() {
-        use super::*;
-        unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                return crate::gpu::recomp::runner::skip_test("no GPU");
-            }
-            let dev = dev.unwrap();
-            // allocators no list records with
-            let (a, b, c) = (usize::MAX - 2, usize::MAX - 1, usize::MAX);
-            let slab = u64::from(pso::CHAIN_COMMAND_BYTES);
-            let (cpu1, gpu1) = constants_for(&dev, a, 2 * slab).unwrap();
-            let (cpu2, gpu2) = constants_for(&dev, a, slab).unwrap();
-            assert_eq!((cpu2 as u64 - cpu1 as u64, gpu2 - gpu1), (2 * slab, 2 * slab));
-            assert_eq!(gpu1 % slab, 0);
-            // another allocator's dispatch gets other memory
-            let (_, gpu3) = constants_for(&dev, b, slab).unwrap();
-            assert!(gpu3 + slab <= gpu1 || gpu3 >= gpu1 + CONSTANTS_BLOCK);
-            // more than the rest of a block: another one, of its size
-            let (_, gpu4) = constants_for(&dev, a, CONSTANTS_BLOCK + slab).unwrap();
-            assert!(gpu4 + CONSTANTS_BLOCK + slab <= gpu1 || gpu4 >= gpu1 + CONSTANTS_BLOCK);
-            std::ptr::write_bytes(cpu1, 0xab, (2 * slab) as usize);
-            // reset, its blocks are used again
-            allocator_reset(a);
-            let mine = |g: u64| (gpu1..gpu1 + CONSTANTS_BLOCK).contains(&g) || (gpu4..gpu4 + CONSTANTS_BLOCK + slab).contains(&g);
-            let (_, again) = constants_for(&dev, c, CONSTANTS_BLOCK).unwrap();
-            assert!(mine(again), "{again:#x}");
-            // but not the bigger one, and no more than the budget
-            {
-                let free = FREE_CONSTANTS.lock().unwrap();
-                assert!(free.iter().all(|f| f.bytes == CONSTANTS_BLOCK), "a block bigger than {CONSTANTS_BLOCK} kept for use again");
-                assert!(free.iter().map(|f| f.bytes).sum::<u64>() <= FREE_CONSTANTS_BYTES);
-            }
-            allocator_reset(b);
-            allocator_reset(c);
-        }
-    }
-
-    #[test]
-    fn a_chained_execute_indirect_keeps_its_commands_when_binding_fails() {
-        use super::*;
+    fn failed_binding_keeps_indirect_commands_until_allocator_reset() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         unsafe extern "system" fn never(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT { E_INVALIDARG }
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
+            let mut dev = None;
             if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
                 return crate::gpu::recomp::runner::skip_test("no GPU");
             }
             let dev = dev.unwrap();
-            let Ok(dxil) = crate::gpu::recomp::dxc::compile("[numthreads(1, 1, 1)] void main() {}", "main", "cs_6_0", &[]) else {
+            let Ok(dxil) = crate::gpu::recomp::dxc::compile("[numthreads(1,1,1)] void main() {}", "main", "cs_6_0", &[]) else {
                 return crate::gpu::recomp::runner::skip_test("no DXC");
             };
             let rs = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
-            let first: ID3D12PipelineState = dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: std::mem::transmute_copy(&rs),
-                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() }, ..Default::default() }).unwrap();
-            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), chain: 0, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
-            let pso = first.as_raw() as usize;
-            CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4, whole_code: Vec::new(), whole: OnceLock::new(),
-                build_whole: Mutex::new(()), waiting: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() }));
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: std::mem::transmute_copy(&rs),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() }, ..Default::default() };
+            let first: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).unwrap();
+            let whole = WholeBuild::new();
+            whole.get_or_build(std::time::Instant::now(), || Ok(first.clone())).unwrap();
+            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), samplers: Vec::new(),
+                flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0, mode: ComputeBuild::DirectChain });
+            let key = first.as_raw() as usize;
+            let plan = Arc::new(DispatchChain { pieces: vec![dxil.clone(), dxil.clone()], dwords_per_group: 4 });
+            assert!(reserve_indirect_source(&INDIRECT_VARIANT_SOURCE, 1, INDIRECT_VARIANT_BYTES));
+            let indirect = Arc::new(IndirectChain { signature: rs.clone(), whole: first.clone(),
+                pieces: vec![first.clone(), first.clone()], _charge: IndirectCharge(1) });
+            let indirect_build = IndirectBuild::new();
+            indirect_build.requested.store(true, Ordering::Relaxed);
+            indirect_build.result.set(Ok(indirect)).unwrap_or_else(|_| unreachable!());
+            CHAINS.lock().unwrap().insert(key, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4,
+                whole_code: Vec::new(), whole, plan: Arc::downgrade(&plan), indirect: indirect_build,
+                indirect_noted: AtomicBool::new(false) }));
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
             let (raw_list, allocator) = (list.as_raw() as usize, alloc.as_raw() as usize);
             super::super::super::alloc_pool::created_on(raw_list, allocator, ty.0);
-            let args = pso::chain_commands_buffer(&dev, 1, 1).unwrap();
-            let r = execute_indirect(&list, pso, allocator, args.GetGPUVirtualAddress(), 12, 1, None, &[[1, 1, 1]], false,
-                || Err("unified memory is full".to_string()));
-            assert_eq!(r, Err("unified memory is full".to_string()));
-            // the program's first ExecuteIndirect asks for its whole form, before any slab is lost
-            assert!(CHAINS.lock().unwrap()[&pso].wanted.load(Ordering::Relaxed));
-            // the slicer's dispatch is recorded: its command buffer lives until the allocator is
-            // reset, and the read-back does not take the rounds that were not recorded
-            // under the title's predication the slicer may not run, so its words are not read back
-            // (reported by @thehollowedone, #2404); without it they are
-            // (`bind` sets the chain's root signature, as `bind_abi` does, on a list with descriptor
-            // heaps, as a title's list has: the signature indexes them directly)
-            let heap = |ty| -> ID3D12DescriptorHeap { dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: 1,
-                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 }).unwrap() };
-            let heaps = [Some(heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)), Some(heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))];
-            for predicated in [true, false] {
-                let bind = || {
-                    list.SetDescriptorHeaps(&heaps);
-                    list.SetComputeRootSignature(&rs);
-                    Ok(())
-                };
-                assert_eq!(execute_indirect(&list, pso, allocator, args.GetGPUVirtualAddress(), 12, 1, None, &[[1, 1, 1]], predicated, bind), Ok(true));
-            }
-            let kept = RECORDINGS.lock().unwrap().get(&allocator).map(|v| v.iter().filter_map(|r| r.indirect.as_ref().map(|i| i.checked)).collect::<Vec<_>>());
-            assert_eq!(kept, Some(vec![false, false, true]));
+            let args = pso::chain_commands_buffer(&dev, 1).unwrap();
+            assert_eq!(execute_indirect(&list, key, key, allocator, args.GetGPUVirtualAddress(), |_| Err("bind failed".into())), Err("bind failed".into()));
+            let recorded = RECORDINGS.lock().unwrap().get(&allocator).unwrap()[0]._indirect_commands.clone().unwrap();
+            let reused = commands_for(&dev, raw_list, allocator, pso::chain_tail_offset(1) + 12).unwrap();
+            assert!(Arc::ptr_eq(&recorded, &reused));
+            list_reset(raw_list);
+            let next_recording = commands_for(&dev, raw_list, allocator, pso::chain_tail_offset(1) + 12).unwrap();
+            assert!(!Arc::ptr_eq(&recorded, &next_recording));
             list.Close().unwrap();
             allocator_reset(allocator);
             list_reset(raw_list);
-            forget(pso);
+            forget(key);
             super::super::super::alloc_pool::forget_list(raw_list);
         }
     }
 
-    /// A title thread that needs the whole form while `want_whole`'s build of it waits for its
-    /// turn (`big_compile_turn`, every background slot taken) does not wait behind that turn: the
-    /// build is then one the title waits for, with the wanted cap and no commit wait (#2404)
     #[test]
-    fn whole_forms_wanted_together_are_built_one_after_another_on_one_thread() {
-        use super::InTurn;
-        use std::sync::{atomic::Ordering, Mutex};
-        static TURNS: InTurn<u32> = InTurn::new();
-        static GATE: Mutex<()> = Mutex::new(());
-        static RAN: Mutex<Vec<(u32, Option<String>)>> = Mutex::new(Vec::new());
-        let gate = GATE.lock().unwrap();
-        for i in 0..5 {
-            TURNS.push(i, |i| {
-                drop(GATE.lock().unwrap());
-                RAN.lock().unwrap().push((i, std::thread::current().name().map(String::from)));
-            });
-        }
-        let started = TURNS.started.load(Ordering::Relaxed);
-        drop(gate);
-        let t = std::time::Instant::now();
-        while RAN.lock().unwrap().len() < 5 && t.elapsed() < std::time::Duration::from_secs(10) {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let ran = RAN.lock().unwrap().clone();
-        assert_eq!(started, 1, "a thread for each of 5 whole forms");
-        assert_eq!(ran, (0..5).map(|i| (i, Some("xcl-pso-chain-whole".to_string()))).collect::<Vec<_>>());
-        // the thread ends with the queue; the next one starts another
-        let t = std::time::Instant::now();
-        while TURNS.queue.lock().unwrap().1 && t.elapsed() < std::time::Duration::from_secs(10) {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        TURNS.push(5, |i| RAN.lock().unwrap().push((i, None)));
-        assert_eq!(TURNS.started.load(Ordering::Relaxed), 2);
-    }
+    fn remap_compile_oom_retries_but_deterministic_failure_is_final() {
+        let at = std::time::Instant::now();
+        let oom = super::super::remap_fallback::compile_error_hr("DXC: E_OUTOFMEMORY (0x8007000E)");
+        let whole: WholeBuild<u32> = WholeBuild::new();
+        assert_eq!(whole.get_or_build(at, || Err(oom)), Err(crate::util::E_OUTOFMEMORY));
+        assert_eq!(whole.get_or_build(at + WHOLE_RETRY, || Ok(7)), Ok(7));
 
-    #[test]
-    fn a_title_thread_does_not_wait_behind_a_background_whole_build_waiting_for_its_turn() {
-        use super::*;
-        use std::time::{Duration, Instant};
-        unsafe extern "system" fn refused(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT { E_INVALIDARG }
-        unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                return crate::gpu::recomp::runner::skip_test("no GPU");
-            }
-            let dev = dev.unwrap();
-            let rs = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
-            let builder = Arc::new(PipelineBuilder { device: dev, create: refused, signature: rs, chain: 0, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
-            // a huge whole form no cache has: its build on `want_whole`'s thread is gated
-            let mut code = vec![0u8; huge_pso_bytes()];
-            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            code[..16].copy_from_slice(&nonce.to_le_bytes());
-            let chain = Arc::new(Chain { builder, tail: Vec::new(), words: 4, whole_code: code, whole: OnceLock::new(),
-                build_whole: Mutex::new(()), waiting: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
-            let held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
-            chain.want_whole();
-            let started = Instant::now();
-            while chain.build_whole.try_lock().is_ok() {
-                assert!(started.elapsed() < Duration::from_secs(10), "the background build did not start");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let (done, waited) = std::sync::mpsc::channel();
-            let title = chain.clone();
-            std::thread::spawn(move || {
-                let _ = title.whole();
-                let _ = done.send(());
-            });
-            let waited = waited.recv_timeout(Duration::from_secs(5));
-            drop(held);
-            assert!(waited.is_ok(), "the title thread waited for the background build's turn");
-        }
+        let compile = super::super::remap_fallback::compile_error_hr("dxc: invalid operation");
+        let deterministic: WholeBuild<u32> = WholeBuild::new();
+        assert_eq!(deterministic.get_or_build(at, || Err(compile)), Err(crate::util::E_INVALIDARG));
+        assert_eq!(deterministic.get_or_build(at + WHOLE_RETRY, || Ok(8)), Err(crate::util::E_INVALIDARG));
     }
 }
