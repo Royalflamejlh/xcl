@@ -41,7 +41,7 @@ so its merge brings `main` up to `f9a0cb80`.
 | #794 | `bee31d56` | hides the title's own 1920x1080 window, which Wine does not cloak (it showed white behind XCL's) |
 | #1462 | `813615c9` | the e2e title's cloak check accepts that hidden window |
 | #3085 | `651867a4` | the launch pass's worker count follows the memory left (#2705 for `main`): under Wine on 32 threads it ran 28 workers and went over 34 GB |
-| #3086 | `f147360f` | the pass's verified compute blobs are kept when the worker count changes |
+| #3086 | `fdbac840` | the pass's verified compute blobs are kept when the worker count changes |
 
 Merge conflicts were resolved by keeping both sides; see each merge commit.
 

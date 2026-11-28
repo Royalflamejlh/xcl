@@ -25,6 +25,7 @@ pub(super) struct Verified {
 struct Entries {
     known: HashSet<[u64; 3]>,
     unsaved: usize,
+    failed_at: usize,
 }
 
 fn read_keys(path: &Path) -> Option<HashSet<[u64; 3]>> {
@@ -74,7 +75,7 @@ impl Verified {
         let mut entries = self.keys.lock().unwrap();
         if entries.known.insert(stamp) {
             entries.unsaved += 1;
-            if entries.unsaved >= 64 { self.flush(&mut entries); }
+            if entries.unsaved >= entries.failed_at + 64 { self.flush(&mut entries); }
         }
     }
 
@@ -85,6 +86,7 @@ impl Verified {
 
     fn flush(&self, entries: &mut Entries) {
         if let Err(e) = self.merge_and_save(entries) {
+            entries.failed_at = entries.unsaved;
             crate::xlog_warn!("Shader preparation: could not save verified compute blob list: {e}");
         }
     }
@@ -107,6 +109,7 @@ impl Verified {
             return Err(std::io::Error::other("could not replace receipt"));
         }
         entries.unsaved = 0;
+        entries.failed_at = 0;
         Ok(())
     }
 }
@@ -167,6 +170,20 @@ mod tests {
         for i in 0..64 { merged.record([4, i, 0]); }
         drop(merged);
         assert!(Verified::open(&dir, native).contains(&[4, 63, 0]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_checkpoint_is_tried_again_after_64_more_entries() {
+        let dir = std::env::temp_dir().join(format!("xcl-warm-failed-{}", std::process::id()));
+        let book = Verified::open(&dir, 7);
+        std::fs::create_dir_all(&book.path).unwrap();
+        for i in 0..100 { book.record([5, i, 0]); }
+        assert_eq!(book.keys.lock().unwrap().failed_at, 64);
+        std::fs::remove_dir(&book.path).unwrap();
+        for i in 100..128 { book.record([5, i, 0]); }
+        let reopened = Verified::open(&dir, 7);
+        assert!(reopened.contains(&[5, 0, 0]) && reopened.contains(&[5, 127, 0]));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
