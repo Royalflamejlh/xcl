@@ -2521,6 +2521,7 @@ pub(super) unsafe fn poll_two_pass_feedback(queue: *mut c_void) {
             let mut raw = [cl.as_raw()];
             type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
             let exec: ExecFn = std::mem::transmute(super::real::orig_fn(queue, 10));
+            let _list_guard = super::real::UnadoptGuard::new(raw[0]);
             exec(queue, 1, raw.as_mut_ptr());
         } else {
             q.ExecuteCommandLists(&[Some(cl)]);
