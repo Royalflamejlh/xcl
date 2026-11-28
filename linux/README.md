@@ -11,6 +11,7 @@ Updated 2026-11-27.
 
 `main` `b49be18` with these pull requests merged, in this order, at these heads. #2477 (with #867) sits on `main` `f9a0cb80`,
 so its merge brings `main` up to `f9a0cb80`.
+`main` `753e8b1a` (2026-11-27, with #3057) is merged on top; that head is built, not run yet.
 
 | Pull request | Head | What it does on Linux |
 |---|---|---|
